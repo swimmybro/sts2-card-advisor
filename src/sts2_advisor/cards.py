@@ -47,14 +47,25 @@ def card_traits(card: Dict[str, Any]) -> List[str]:
     return [t for t in TRAITS if t in found]
 
 
+DEFENSIVE_POWERS = {"Weak", "Intangible", "Plating", "Buffer"}
+
+
+def is_defensive(card: Dict[str, Any]) -> bool:
+    """Reduces incoming damage: gives block, or applies Weak / Intangible / Plating / Buffer."""
+    return (card.get("block") or 0) > 0 or any(
+        p.get("power") in DEFENSIVE_POWERS for p in card.get("powers_applied") or [])
+
+
 def write_cards_csv(catalog: List[Dict[str, Any]], out: Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["id", "type", "rarity", "color", "cost", "is_x_cost", "traits"])
+        w.writerow(["id", "type", "rarity", "color", "cost", "is_x_cost", "traits",
+                    "draw", "defensive"])
         for c in sorted(catalog, key=lambda c: c["id"]):
             w.writerow([c["id"], c["type"], c["rarity"], c["color"], c["cost"],
-                        bool(c.get("is_x_cost")), "|".join(card_traits(c))])
+                        bool(c.get("is_x_cost")), "|".join(card_traits(c)),
+                        c.get("cards_draw") or 0, is_defensive(c)])
 
 
 def fetch_catalog(url: str = CATALOG_URL) -> List[Dict[str, Any]]:

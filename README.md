@@ -56,8 +56,8 @@ This writes `data/processed/offers.parquet`: one row per card in each post-comba
 | Column group | Columns |
 | --- | --- |
 | Run context | `character`, `ascension`, `build_id`, `act`, `floor`, `room_type`, `hp`, `max_hp`, `hp_frac`, `gold`, `n_relics`, `relics_held` (`\|`-separated IDs) |
-| Deck before the pick | `deck_size`, `deck_attacks`, `deck_skills`, `deck_powers`, `deck_curses`, `deck_basics`, `deck_avg_cost`, plus one count per card trait (`deck_exhaust`, `deck_block`, `deck_strength`, …) |
-| Candidate | `candidate`, `is_skip`, `cand_type`, `cand_rarity`, `cand_cost`, `cand_upgraded`, `cand_copies_in_deck`, `cand_n_traits`, `cand_synergy`, `n_offered` |
+| Deck before the pick | `deck_size`, `deck_attacks`, `deck_skills`, `deck_powers`, `deck_curses`, `deck_basics`, `deck_avg_cost`, one count per card trait (`deck_exhaust`, `deck_block`, `deck_strength`, …), and deckbuilding measures: `deck_upgraded`, `deck_upgrade_density`, `deck_block_density`, `deck_cycle_time`, `deck_redraw_time` |
+| Candidate | `candidate`, `is_skip`, `cand_type`, `cand_rarity`, `cand_cost`, `cand_upgraded`, `cand_copies_in_deck`, `cand_n_traits`, `cand_synergy`, `n_offered`, and how taking it changes the deck measures: `cand_d_upgrade_density`, `cand_d_block_density`, `cand_d_cycle_time`, `cand_d_redraw_time` (all 0 for `SKIP`) |
 | Labels | `picked`; `run_won` (blank for abandoned runs); `floors_reached` |
 | Splitting | `group`: the player's `player_token` when known, otherwise the run |
 
@@ -76,6 +76,14 @@ How it works and what it leaves out:
 
   `cand_synergy` counts how many deck cards share a trait with the candidate.
 - **Relics:** `relics_held` lists the relics held *before* each reward. Training turns the 60 most common relics into individual 0/1 columns (`relic_<ID>`).
+- **Deckbuilding measures**, after Baalorlord's [Core Deckbuilding Concepts](https://sts2.untapped.gg/en/articles/core-deckbuilding-concepts-in-slay-the-spire):
+  - **Upgrade density:** upgraded cards ÷ deck size. The deck rebuild tracks logged upgrades, downgrades, and upgraded cards gained, removed or transformed; the count matches the final deck in 98.5% of runs.
+  - **Block density:** cards that reduce incoming damage ÷ deck size. A card counts if it blocks, or applies Weak, Intangible, Plating or Buffer (the `defensive` column in `cards.csv`).
+  - **Cycle time:** (deck size − cards drawn by draw effects) ÷ 5, the turns needed to see the whole deck.
+  - **Redraw time:** the same for later shuffles, leaving out powers and Exhaust cards, which don't come back.
+  - **Each option's change** to these measures: for example, a card that draws 2 shortens the cycle, while a filler card lengthens it.
+
+  In the community data, upgrade density and cycle time both strongly predict winning, independently of each other. Block density shows no 33% sweet spot.
 - **Splitting:** use `features.split_by_group` for train/test splits, so no run (or player) lands on both sides.
 
 ## Training the card-pick model

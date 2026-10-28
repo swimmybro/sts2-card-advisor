@@ -188,10 +188,12 @@ def test_load_card_meta(tmp_path):
     p.write_text("id,type,rarity,color,cost,is_x_cost,traits\n"
                  "BASH,Attack,Basic,ironclad,2,False,Vulnerable\n"
                  "ZAP,Skill,Basic,defect,1,False,\n")
+    # files without draw/defensive columns (older snapshots) default to 0 / False
     assert load_card_meta(p) == {
         "BASH": {"type": "Attack", "rarity": "Basic", "cost": 2,
-                 "traits": frozenset({"Vulnerable"})},
-        "ZAP": {"type": "Skill", "rarity": "Basic", "cost": 1, "traits": frozenset()},
+                 "traits": frozenset({"Vulnerable"}), "draw": 0, "defensive": False},
+        "ZAP": {"type": "Skill", "rarity": "Basic", "cost": 1, "traits": frozenset(),
+                "draw": 0, "defensive": False},
     }
 
 
@@ -220,6 +222,54 @@ def test_deck_traits_and_synergy():
     assert r["SHRUG"]["cand_synergy"] == 3 + 1  # 3 Block cards + 1 Draw card
     assert r["MYSTERY"]["cand_synergy"] == 0 and r["MYSTERY"]["cand_type"] is None
     assert r[SKIP]["cand_synergy"] is None
+
+
+MEASURE_META = {
+    "STRIKE": {"type": "Attack", "traits": frozenset({"Strike"})},
+    "DEFEND": {"type": "Skill", "defensive": True},
+    "BACKFLIP": {"type": "Skill", "defensive": True, "draw": 2},
+    "INFLAME": {"type": "Power"},
+    "TRUE_GRIT": {"type": "Skill", "defensive": True, "traits": frozenset({"Exhaust"})},
+}
+
+
+def test_deck_measures():
+    deck = Counter({"STRIKE": 5, "DEFEND": 4, "BACKFLIP": 1, "INFLAME": 1, "TRUE_GRIT": 1})
+    rows = reward_rows({"hp": 50, "max_hp": 80, "deck_upgraded": 3},
+                       [{"id": "BACKFLIP"}, {"id": "STRIKE", "upgraded": True}],
+                       deck, MEASURE_META)
+    r = {row["candidate"]: row for row in rows}
+    base = r[SKIP]
+    assert base["deck_upgrade_density"] == pytest.approx(3 / 12)
+    assert base["deck_block_density"] == pytest.approx(6 / 12)  # 4 Defend, Backflip, True Grit
+    assert base["deck_cycle_time"] == pytest.approx((12 - 2) / 5)
+    assert base["deck_redraw_time"] == pytest.approx((10 - 2) / 5)  # no Inflame / True Grit
+
+    # Backflip draws 2: one more card but two more draws -> shorter cycle
+    assert r["BACKFLIP"]["cand_d_cycle_time"] == pytest.approx(9 / 5 - 10 / 5)
+    assert r["BACKFLIP"]["cand_d_block_density"] == pytest.approx(7 / 13 - 6 / 12)
+    # an upgraded Strike raises upgrade density, lowers block density, lengthens the cycle
+    s = r["STRIKE"]
+    assert s["cand_d_upgrade_density"] == pytest.approx(4 / 13 - 3 / 12)
+    assert s["cand_d_block_density"] < 0 and s["cand_d_cycle_time"] == pytest.approx(0.2)
+    # skipping changes nothing
+    assert all(base[k] == 0.0 for k in ("cand_d_upgrade_density", "cand_d_block_density",
+                                        "cand_d_cycle_time", "cand_d_redraw_time"))
+
+
+def test_upgrades_tracked_through_the_run():
+    history = [[
+        point("monster", card_choices=offer("ANGER", "INFLAME", picked="ANGER", upgraded=("ANGER",)),
+              cards_gained=[card("ANGER", current_upgrade_level=1)]),
+        point("rest_site", upgraded_cards=["CARD.STRIKE"]),
+        point("shop", cards_removed=[card("ANGER", current_upgrade_level=1)]),
+        point("elite", card_choices=offer("INFLAME", "HEADBUTT", picked="INFLAME")),
+    ]]
+    rows = offer_rows(make_run(history, ["STRIKE", "STRIKE", "DEFEND", "INFLAME"]),
+                      "r1", "mine", META)
+    upgraded_at = {r["floor"]: r["deck_upgraded"] for r in rows if r["is_skip"]}
+    # floor 1: none yet; floor 4: +1 gained upgraded, +1 rest upgrade, -1 removed upgraded
+    assert upgraded_at == {1: 0, 4: 1}
 
 
 def test_deck_cards_before_the_pick():

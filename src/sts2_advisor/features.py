@@ -57,12 +57,19 @@ OFFER_SCHEMA = pa.schema([
     ("deck_curses", pa.int64()), ("deck_basics", pa.int64()),
     ("deck_avg_cost", pa.float64()),
     *[(col, pa.int64()) for col in TRAIT_COLUMNS.values()],
+    # deckbuilding measures (see deck_measures)
+    ("deck_upgraded", pa.int64()), ("deck_upgrade_density", pa.float64()),
+    ("deck_block_density", pa.float64()), ("deck_cycle_time", pa.float64()),
+    ("deck_redraw_time", pa.float64()),
     # candidate
     ("n_offered", pa.int64()), ("candidate", pa.string()), ("is_skip", pa.bool_()),
     ("cand_type", pa.string()), ("cand_rarity", pa.string()),
     ("cand_cost", pa.int64()), ("cand_upgraded", pa.bool_()),
     ("cand_copies_in_deck", pa.int64()),
     ("cand_n_traits", pa.int64()), ("cand_synergy", pa.int64()),
+    # how taking the option changes the deck measures (0 for SKIP)
+    ("cand_d_upgrade_density", pa.float64()), ("cand_d_block_density", pa.float64()),
+    ("cand_d_cycle_time", pa.float64()), ("cand_d_redraw_time", pa.float64()),
     # labels
     ("picked", pa.bool_()), ("run_won", pa.bool_()), ("floors_reached", pa.int64()),
 ])
@@ -108,8 +115,73 @@ def load_card_meta(path: Path) -> Dict[str, dict]:
     with open(path, newline="", encoding="utf-8") as f:
         return {r["id"]: {"type": r["type"], "rarity": r["rarity"],
                           "cost": int(r["cost"]),
-                          "traits": frozenset(filter(None, (r.get("traits") or "").split("|")))}
+                          "traits": frozenset(filter(None, (r.get("traits") or "").split("|"))),
+                          "draw": int(r.get("draw") or 0),
+                          "defensive": r.get("defensive") == "True"}
                 for r in csv.DictReader(f)}
+
+
+def _upgrade_changes(stats: Dict[str, Any]) -> int:
+    """Net change in the number of upgraded cards at one map point."""
+    def up(card: Dict[str, Any]) -> bool:
+        return (card.get("current_upgrade_level") or 0) > 0
+
+    n = len(stats.get("upgraded_cards", [])) - len(stats.get("downgraded_cards", []))
+    n += sum(up(c) for c in stats.get("cards_gained", []))
+    n -= sum(up(c) for c in stats.get("cards_removed", []))
+    for t in stats.get("cards_transformed", []):
+        n += up(t["final_card"]) - up(t["original_card"])
+    return n
+
+
+# Cards drawn per turn without draw effects.
+HAND_SIZE = 5
+
+
+def _deck_totals(deck: Counter, meta: Dict[str, dict]) -> Dict[str, int]:
+    """Counts behind the deckbuilding measures."""
+    size = sum(deck.values())
+    defensive = draw = staying = 0
+    for card, n in deck.items():
+        m = meta.get(card, {})
+        defensive += n * m.get("defensive", False)
+        draw += n * m.get("draw", 0)
+        # powers and Exhaust cards don't come back after a reshuffle
+        staying += n * (m.get("type") != "Power" and "Exhaust" not in m.get("traits", ()))
+    return {"size": size, "defensive": defensive, "draw": draw, "staying": staying}
+
+
+def deck_measures(t: Dict[str, int], n_upgraded: int) -> Dict[str, Any]:
+    """Deckbuilding measures from Baalorlord's 'Core Deckbuilding Concepts':
+
+    * upgrade density: upgraded cards / deck size
+    * block density: cards that reduce incoming damage / deck size
+    * cycle time: turns to draw the whole deck, (size - card draw) / 5
+    * redraw time: the same after the first shuffle, without powers and Exhaust cards
+    """
+    size = t["size"]
+    return {
+        "deck_upgraded": n_upgraded,
+        "deck_upgrade_density": min(n_upgraded, size) / size if size else None,
+        "deck_block_density": t["defensive"] / size if size else None,
+        "deck_cycle_time": max(size - t["draw"], 0) / HAND_SIZE,
+        "deck_redraw_time": max(t["staying"] - t["draw"], 0) / HAND_SIZE,
+    }
+
+
+def option_deltas(t: Dict[str, int], n_upgraded: int, card: Optional[str], upgraded: bool,
+                  meta: Dict[str, dict]) -> Dict[str, float]:
+    """How taking ``card`` changes the deck measures (all 0 for SKIP)."""
+    keys = ("upgrade_density", "block_density", "cycle_time", "redraw_time")
+    if card is None:
+        return {f"cand_d_{k}": 0.0 for k in keys}
+    m = meta.get(card, {})
+    after = dict(t, size=t["size"] + 1, defensive=t["defensive"] + m.get("defensive", False),
+                 draw=t["draw"] + m.get("draw", 0),
+                 staying=t["staying"] + (m.get("type") != "Power"
+                                         and "Exhaust" not in m.get("traits", ())))
+    before, now = deck_measures(t, n_upgraded), deck_measures(after, n_upgraded + upgraded)
+    return {f"cand_d_{k}": (now[f"deck_{k}"] or 0) - (before[f"deck_{k}"] or 0) for k in keys}
 
 
 def _deck_changes(stats: Dict[str, Any]) -> Counter:
@@ -169,17 +241,19 @@ def reward_rows(base: Dict[str, Any], candidates: List[Dict[str, Any]],
     """Rows for one card reward: each candidate plus a ``SKIP`` row.
 
     ``base`` holds the run state (character, ascension, act, floor,
-    room_type, hp, max_hp, gold, n_relics, plus any id/label fields).
-    ``candidates`` are ``{"id", "upgraded", "picked"}`` dicts; ``picked``
-    may be omitted when scoring a live reward. ``deck`` is the deck
-    *before* the pick. Shared by the feature builder and the API so both
-    compute features the same way.
+    room_type, hp, max_hp, gold, n_relics, ``deck_upgraded`` (upgraded cards
+    in the deck), plus any id/label fields). ``candidates`` are
+    ``{"id", "upgraded", "picked"}`` dicts; ``picked`` may be omitted when
+    scoring a live reward. ``deck`` is the deck *before* the pick. Shared by
+    the feature builder and the API so both compute features the same way.
     """
     hp, max_hp = base.get("hp"), base.get("max_hp")
+    n_up = base.get("deck_upgraded") or 0
+    totals = _deck_totals(deck, meta)
     base = dict(base, n_offered=len(candidates),
                 hp_frac=hp / max_hp if hp is not None and max_hp else None,
                 deck_cards=deck_string(deck),
-                **_deck_features(deck, meta))
+                **_deck_features(deck, meta), **deck_measures(totals, n_up))
     rows = []
     for c in candidates:
         m = meta.get(c["id"], {})
@@ -191,12 +265,14 @@ def reward_rows(base: Dict[str, Any], candidates: List[Dict[str, Any]],
             cand_n_traits=len(traits),
             # deck cards sharing each of the candidate's traits, summed
             cand_synergy=sum(base[TRAIT_COLUMNS[t]] for t in traits if t in TRAIT_COLUMNS),
+            **option_deltas(totals, n_up, c["id"], bool(c.get("upgraded")), meta),
             picked=bool(c.get("picked")),
         ))
     rows.append(dict(
         base, candidate=SKIP, is_skip=True, cand_type=None, cand_rarity=None,
         cand_cost=None, cand_upgraded=None, cand_copies_in_deck=None,
         cand_n_traits=None, cand_synergy=None,
+        **option_deltas(totals, n_up, None, False, meta),
         picked=not any(c.get("picked") for c in candidates),
     ))
     return rows
@@ -249,6 +325,7 @@ def offer_rows(data: Dict[str, Any], run_id: str, source: str,
 
     rows: List[dict] = []
     floor = 0
+    n_upgraded = 0  # upgraded cards in the deck (matches the final deck in ~98.5% of runs)
     for act_idx, act in enumerate(data["map_point_history"], start=1):
         for point in act:
             floor += 1
@@ -268,7 +345,7 @@ def offer_rows(data: Dict[str, Any], run_id: str, source: str,
                     run_ctx,
                     offer_id=f"{run_id}:{floor}", act=act_idx, floor=floor,
                     room_type=point["map_point_type"], hp=hp, max_hp=max_hp,
-                    gold=stats.get("current_gold"),
+                    gold=stats.get("current_gold"), deck_upgraded=n_upgraded,
                     # relics gained on earlier floors only
                     **relic_fields(r for _, r in relics[:bisect.bisect_left(relic_floors, floor)]),
                 )
@@ -281,6 +358,7 @@ def offer_rows(data: Dict[str, Any], run_id: str, source: str,
                 rows.extend(reward_rows(base, candidates, deck, meta))
             # Changes at this point happen at/after the reward, so apply them last.
             deck.update(_deck_changes(stats))
+            n_upgraded = max(n_upgraded + _upgrade_changes(stats), 0)
     return rows
 
 

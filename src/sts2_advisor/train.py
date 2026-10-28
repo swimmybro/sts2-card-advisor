@@ -32,8 +32,12 @@ NUMERIC_FEATURES = [
     "ascension", "act", "floor", "hp_frac", "gold", "n_relics",
     "deck_size", "deck_attacks", "deck_skills", "deck_powers", "deck_curses",
     "deck_basics", "deck_avg_cost", *TRAIT_COLUMNS.values(),
+    "deck_upgraded", "deck_upgrade_density", "deck_block_density", "deck_cycle_time",
+    "deck_redraw_time",
     "n_offered", "cand_cost", "cand_upgraded", "cand_copies_in_deck",
-    "cand_n_traits", "cand_synergy", "is_skip",
+    "cand_n_traits", "cand_synergy",
+    "cand_d_upgrade_density", "cand_d_block_density", "cand_d_cycle_time",
+    "cand_d_redraw_time", "is_skip",
 ]
 CATEGORICAL_FEATURES = ["character", "candidate", "cand_type", "cand_rarity", "room_type"]
 FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES

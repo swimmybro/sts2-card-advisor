@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,7 +28,9 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from sts2_advisor.features import DEFAULT_CARD_META, TRAIT_COLUMNS, load_card_meta
+from sts2_advisor.features import (
+    DEFAULT_CARD_META, TRAIT_COLUMNS, _deck_totals, load_card_meta, option_deltas,
+)
 from sts2_advisor.train import (
     CATEGORICAL_FEATURES, fit_categories, load_model, load_offers, log_to_mlflow,
     predict, save_model, split_data, to_matrix, top_picks,
@@ -207,7 +210,9 @@ def reliability_metrics(df: pd.DataFrame, win_scores: np.ndarray, pick_scores: n
 # ------------------------------------------------------------------------- main
 
 DECK_COLUMNS = ["deck_size", "deck_attacks", "deck_skills", "deck_powers", "deck_curses",
-                "deck_basics", "deck_avg_cost", *TRAIT_COLUMNS.values()]
+                "deck_basics", "deck_avg_cost", *TRAIT_COLUMNS.values(),
+                "deck_upgraded", "deck_upgrade_density", "deck_block_density",
+                "deck_cycle_time", "deck_redraw_time"]
 
 
 def deck_sensitivity(df: pd.DataFrame, booster: lgb.Booster, categories: Dict[str, List[str]],
@@ -244,7 +249,8 @@ def deck_sensitivity(df: pd.DataFrame, booster: lgb.Booster, categories: Dict[st
         donor_decks = store.strings(donors)
     source = offers.set_index("offer_id").loc[donors]
     swapped = rows.copy()
-    swapped[DECK_COLUMNS] = source[DECK_COLUMNS].to_numpy()
+    deck_cols = [c for c in DECK_COLUMNS if c in df]  # older tables lack the newer ones
+    swapped[deck_cols] = source[deck_cols].to_numpy()
     swapped["deck_cards"] = donor_decks
     decks = [d.split("|") if d else [] for d in swapped["deck_cards"]]
     cards = swapped["candidate"].to_numpy()
@@ -254,6 +260,13 @@ def deck_sensitivity(df: pd.DataFrame, booster: lgb.Booster, categories: Dict[st
     swapped["cand_synergy"] = [
         np.nan if s else sum(row[TRAIT_COLUMNS[t]] for t in meta.get(c, {}).get("traits", ()))
         for c, s, (_, row) in zip(cards, is_skip, swapped[list(TRAIT_COLUMNS.values())].iterrows())]
+    if "deck_upgraded" in df:  # each option's change to the swapped-in deck's measures
+        n_up = swapped["deck_upgraded"].fillna(0).astype(int).to_numpy()
+        upgraded = swapped["cand_upgraded"].fillna(False).astype(bool).to_numpy()
+        deltas = [option_deltas(_deck_totals(Counter(deck), meta), u, None if s else c, up, meta)
+                  for deck, u, c, up, s in zip(decks, n_up, cards, upgraded, is_skip)]
+        for k in deltas[0] if deltas else ():
+            swapped[k] = [d[k] for d in deltas]
 
     ids = rows["offer_id"].to_numpy()
     before, after = predict(booster, categories, rows), predict(booster, categories, swapped)

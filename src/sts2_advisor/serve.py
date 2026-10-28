@@ -125,7 +125,8 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
 
     @app.post("/rank", response_model=RankResponse)
     def rank(req: RankRequest) -> RankResponse:
-        deck = Counter(normalize_card(c)[0] for c in req.deck)
+        deck_cards = [normalize_card(c) for c in req.deck]
+        deck = Counter(cid for cid, _ in deck_cards)
         candidates = []
         for c in req.offered:
             cid, up = normalize_card(c) if isinstance(c, str) else normalize_card(c.id)
@@ -133,6 +134,7 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
         base = {"character": req.character, "ascension": req.ascension, "act": req.act,
                 "floor": req.floor, "room_type": req.room_type, "hp": req.hp,
                 "max_hp": req.max_hp, "gold": req.gold,
+                "deck_upgraded": sum(up for _, up in deck_cards),
                 **relic_fields(normalize_id(r, "relic") for r in req.relics)}
         rows = pd.DataFrame(reward_rows(base, candidates, deck, advisor.meta)).assign(offer_id=0)
         rows = advisor.score(rows)
