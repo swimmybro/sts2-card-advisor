@@ -154,6 +154,33 @@ A win chance for an option players rarely take rests on few, unusual runs. With 
 
 The settings are saved to `models/win_prob/reliability.json`, so the API applies exactly what was evaluated. The report shows the ranking metrics before and after the check.
 
+### How much to trust the advice
+
+A trust check (October 2026, current models) used the community test runs, which the models never trained on: 423,867 card rewards from 34,039 finished runs. It compared the win rate when players took the advisor's suggestion against the win rate when they didn't. Comparisons were made **within the same situation** (character, ascension band, act, floor band, HP band) and then averaged. The 95% ranges come from resampling whole runs, since a run's rewards share one outcome.
+
+| Took… | Win-rate gain vs not taking it (matched) |
+| --- | --- |
+| The advisor's suggestion | **+4.9 pts** [4.6, 5.2] |
+| The popular choice (pick model's top option) | +3.5 pts [3.2, 3.7] |
+| The advisor's pick, where it disagreed with the popular choice (clear calls only) | +2.9 pts [2.1, 3.5] over taking the popular one |
+
+The overall win rate is 39%. The gain grows with how clear the advisor says the call is, meaning the suggestion's win chance minus the next-best option's:
+
+| Predicted margin | under 1 pt (tie) | 1–2 pts | 2–4 pts | 4–8 pts | 8+ pts |
+| --- | --- | --- | --- | --- | --- |
+| Observed gain from following it | +2.7 | +3.9 | +5.1 | +7.6 | +11.9 |
+
+Following its skip suggestions showed +5.8 points, and its card suggestions +4.5.
+
+**Reading this:**
+- **Trust the clear calls,** especially those with a margin of 2 points or more.
+- **Treat ties as close calls,** where your own read of the deck is as good as the advisor's. The popular choice that breaks them still showed +2.7.
+
+**Caveats:**
+- **Observational, not a controlled test.** The data has no player IDs, so player skill can't be matched, and part of the gain likely reflects stronger players making the same picks. Two things suggest the advice still carries real information: it beats the popular choice head to head, and the gain rises steadily with the predicted margin.
+- **Observed gains run larger than predicted margins.** That's consistent with some skill effect, so read the margins as how clear a call is, not as exact promises.
+- **Your own runs weren't checked:** about 3,500 rewards is too few for this matching.
+
 ## Card advisor API
 
 Serve the trained model over HTTP:
