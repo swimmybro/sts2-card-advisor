@@ -144,7 +144,7 @@ def test_parse_jsonl_gz_export(tmp_path):
     runs, choices, stats = parse_dir(tmp_path)
     assert list(runs["run_id"]) == ["h1", "h2"]
     assert set(runs["source"]) == {"codex"} and set(choices["source"]) == {"codex"}
-    assert runs["player_token"].tolist() == ["tok", None]
+    assert runs["player_token"].iloc[0] == "tok" and pd.isna(runs["player_token"].iloc[1])
     assert stats.n_errors == 1 and ":3" in stats.errors[0]
 
 

@@ -222,3 +222,4 @@ data/raw/
 data/processed/
 mlruns/
 data/external/
+models/

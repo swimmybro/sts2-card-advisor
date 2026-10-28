@@ -66,6 +66,26 @@ How it works and what it leaves out:
 - **Card metadata:** type, rarity and cost come from [`configs/cards.csv`](configs/cards.csv), a snapshot of Spire Codex's `/api/cards`.
 - **Splitting:** use `features.split_by_group` for train/test splits, so no run (or player) lands on both sides.
 
+## Training the card-pick model
+
+LightGBM needs OpenMP. On macOS, install it first with `brew install libomp`.
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.train --config configs/train.yaml
+```
+
+This trains a LightGBM ranker on `offers.parquet`. Within each reward it scores every candidate, including `SKIP`; the highest score is the suggested pick. Settings live in [`configs/train.yaml`](configs/train.yaml).
+
+- **Split:** community runs are split 70/10/20 into train, early-stopping validation and test, with no run on both sides. Your own runs are never trained on; they're reported as a separate test set.
+- **Baselines:** the model is compared with `random` and with each card's historical pick rate, both overall and per character.
+- **Metrics:**
+  - top-1: how often the top-scored row is the actual pick.
+  - MRR: mean reciprocal rank of the actual pick.
+  - Skip precision and recall.
+- **Outputs:** saved to `models/card_pick/`, which holds `model.txt`, `categories.json` and `metrics.json`. Each run is also logged to MLflow in `mlruns/`; browse them with `.venv/bin/mlflow ui --backend-store-uri mlruns`.
+
+The model learns which card players *pick*, not which pick *wins*. It matches community choices, which are not necessarily the best ones.
+
 ## Tests
 
 ```bash

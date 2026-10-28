@@ -1,0 +1,27 @@
+# Card-pick model training (python -m sts2_advisor.train --config configs/train.yaml)
+
+data:
+  offers: data/processed/offers.parquet
+
+split:
+  test_frac: 0.2      # share of community runs held out for testing
+  valid_frac: 0.1     # share of training runs used for early stopping
+  seed: 0
+  hold_out_mine: true # evaluate on your own runs separately; never train on them
+
+model:
+  objective: lambdarank
+  learning_rate: 0.05
+  num_leaves: 63
+  min_data_in_leaf: 100
+  feature_fraction: 0.9
+  num_boost_round: 1000
+  early_stopping_rounds: 50
+
+output:
+  model_dir: models/card_pick
+
+mlflow:
+  enabled: true
+  tracking_uri: mlruns
+  experiment: card-pick
