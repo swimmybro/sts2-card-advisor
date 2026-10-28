@@ -82,7 +82,7 @@ This trains a LightGBM ranker on `offers.parquet`. Within each reward it scores 
   - top-1: how often the top-scored row is the actual pick.
   - MRR: mean reciprocal rank of the actual pick.
   - Skip precision and recall.
-- **Outputs:** saved to `models/card_pick/`, which holds `model.txt`, `categories.json` and `metrics.json`. Each run is also logged to MLflow in `mlruns/`; browse them with `.venv/bin/mlflow ui --backend-store-uri mlruns`.
+- **Outputs:** saved to `models/card_pick/`, which holds `model.txt`, `categories.json` and `metrics.json`. Each run is also logged to MLflow: run details go to a SQLite database at `mlruns/mlflow.db`, and saved files to `mlruns/artifacts/`. Browse runs with `.venv/bin/mlflow ui --backend-store-uri sqlite:///mlruns/mlflow.db`.
 
 The model learns which card players *pick*, not which pick *wins*. It matches community choices, which are not necessarily the best ones.
 

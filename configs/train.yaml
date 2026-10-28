@@ -23,5 +23,6 @@ output:
 
 mlflow:
   enabled: true
-  tracking_uri: mlruns
+  db_path: mlruns/mlflow.db        # run metadata (SQLite)
+  artifact_dir: mlruns/artifacts   # saved models and metrics
   experiment: card-pick

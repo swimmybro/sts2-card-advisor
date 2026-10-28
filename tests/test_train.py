@@ -71,7 +71,8 @@ def config(tmp_path, mlflow=False):
                   "min_data_in_leaf": 5, "num_boost_round": 200,
                   "early_stopping_rounds": 20},
         "output": {"model_dir": str(tmp_path / "model")},
-        "mlflow": {"enabled": mlflow, "tracking_uri": str(tmp_path / "mlruns"),
+        "mlflow": {"enabled": mlflow, "db_path": str(tmp_path / "mlruns" / "mlflow.db"),
+                   "artifact_dir": str(tmp_path / "mlruns" / "artifacts"),
                    "experiment": "test"},
     }
 
@@ -98,4 +99,5 @@ def test_main_logs_to_mlflow(tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert "Community test set:" in out and "Your runs (held out):" in out
-    assert any((tmp_path / "mlruns").rglob("model.txt"))
+    assert (tmp_path / "mlruns" / "mlflow.db").exists()
+    assert any((tmp_path / "mlruns" / "artifacts").rglob("model.txt"))

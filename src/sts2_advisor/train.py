@@ -192,10 +192,17 @@ def run(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _log_mlflow(cfg: Dict[str, Any], metrics: Dict[str, Any], model_dir: Path) -> None:
+    """Log to a SQLite-backed MLflow store (newer MLflow rejects plain folders)."""
     import mlflow
 
-    mlflow.set_tracking_uri(cfg["mlflow"]["tracking_uri"])
-    mlflow.set_experiment(cfg["mlflow"]["experiment"])
+    m = cfg["mlflow"]
+    db = Path(m["db_path"])
+    db.parent.mkdir(parents=True, exist_ok=True)
+    mlflow.set_tracking_uri(f"sqlite:///{db.resolve()}")
+    if mlflow.get_experiment_by_name(m["experiment"]) is None:
+        mlflow.create_experiment(m["experiment"],
+                                 artifact_location=Path(m["artifact_dir"]).resolve().as_uri())
+    mlflow.set_experiment(m["experiment"])
     with mlflow.start_run():
         mlflow.log_params({f"model.{k}": v for k, v in cfg["model"].items()})
         mlflow.log_params({f"split.{k}": v for k, v in cfg["split"].items()})
