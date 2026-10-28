@@ -1,11 +1,12 @@
 import json
+from collections import Counter
 
 import pandas as pd
 import pytest
 
 from sts2_advisor.features import (
     SKIP, BadHpError, DeckReplayError, FeatureStats, load_card_meta, main,
-    offer_rows, split_by_group, starting_deck,
+    offer_rows, reward_rows, split_by_group, starting_deck,
 )
 from sts2_advisor.parse import ParseStats
 
@@ -184,8 +185,53 @@ def test_split_by_group_keeps_players_on_one_side():
 
 def test_load_card_meta(tmp_path):
     p = tmp_path / "cards.csv"
-    p.write_text("id,type,rarity,color,cost,is_x_cost\nBASH,Attack,Basic,ironclad,2,False\n")
-    assert load_card_meta(p) == {"BASH": {"type": "Attack", "rarity": "Basic", "cost": 2}}
+    p.write_text("id,type,rarity,color,cost,is_x_cost,traits\n"
+                 "BASH,Attack,Basic,ironclad,2,False,Vulnerable\n"
+                 "ZAP,Skill,Basic,defect,1,False,\n")
+    assert load_card_meta(p) == {
+        "BASH": {"type": "Attack", "rarity": "Basic", "cost": 2,
+                 "traits": frozenset({"Vulnerable"})},
+        "ZAP": {"type": "Skill", "rarity": "Basic", "cost": 1, "traits": frozenset()},
+    }
+
+
+TRAIT_META = {
+    "STRIKE": {"type": "Attack", "rarity": "Basic", "cost": 1, "traits": frozenset({"Strike"})},
+    "DEFEND": {"type": "Skill", "rarity": "Basic", "cost": 1,
+               "traits": frozenset({"Defend", "Block"})},
+    "SHRUG": {"type": "Skill", "rarity": "Common", "cost": 1,
+              "traits": frozenset({"Block", "Draw"})},
+    "PERFECTED": {"type": "Attack", "rarity": "Common", "cost": 2,
+                  "traits": frozenset({"Strike"})},
+    "CURSE": {"type": "Curse", "rarity": "Curse", "cost": -1, "traits": frozenset()},
+}
+
+
+def test_deck_traits_and_synergy():
+    deck = Counter({"STRIKE": 3, "DEFEND": 2, "SHRUG": 1, "CURSE": 1})
+    rows = reward_rows({"hp": 10, "max_hp": 20}, [{"id": "PERFECTED"}, {"id": "SHRUG"},
+                                                  {"id": "MYSTERY"}], deck, TRAIT_META)
+    r = {row["candidate"]: row for row in rows}
+    perfected = r["PERFECTED"]
+    assert (perfected["deck_strike"], perfected["deck_block"], perfected["deck_draw"]) == (3, 3, 1)
+    assert perfected["deck_basics"] == 5
+    assert perfected["deck_avg_cost"] == 1.0  # the unplayable curse (cost -1) is ignored
+    assert perfected["cand_synergy"] == 3 and perfected["cand_n_traits"] == 1
+    assert r["SHRUG"]["cand_synergy"] == 3 + 1  # 3 Block cards + 1 Draw card
+    assert r["MYSTERY"]["cand_synergy"] == 0 and r["MYSTERY"]["cand_type"] is None
+    assert r[SKIP]["cand_synergy"] is None
+
+
+def test_relics_held_at_each_reward():
+    run = make_run(STANDARD_HISTORY, STANDARD_FINAL)
+    run["players"][0]["relics"] = [{"id": "RELIC.BURNING_BLOOD", "floor_added_to_deck": 1},
+                                   {"id": "RELIC.ANCHOR", "floor_added_to_deck": 3},
+                                   {"id": "RELIC.VAJRA", "floor_added_to_deck": 4}]
+    offers = by_offer(offer_rows(run, "r1", "mine", META))
+    assert offers[1][SKIP]["relics_held"] == "" and offers[1][SKIP]["n_relics"] == 0
+    # floor 4: relics from floors 1 and 3 (not the one gained at this reward)
+    assert offers[4][SKIP]["relics_held"] == "ANCHOR|BURNING_BLOOD"
+    assert offers[4][SKIP]["n_relics"] == 2
 
 
 def test_main_end_to_end(tmp_path, capsys):

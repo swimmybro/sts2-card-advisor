@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from sts2_advisor.serve import create_app, normalize_card
+from sts2_advisor.serve import create_app, normalize_card, normalize_id
 from sts2_advisor.train import run
 from test_train import config, synthetic_offers
 
@@ -74,3 +74,8 @@ def test_normalize_card():
     assert normalize_card("Shrug It Off") == ("SHRUG_IT_OFF", False)
     assert normalize_card("CARD.BASH+") == ("BASH", True)
     assert normalize_card(" card.pommel_strike ") == ("POMMEL_STRIKE", False)
+
+
+def test_normalize_relic():
+    assert normalize_id("Burning Blood", "relic") == "BURNING_BLOOD"
+    assert normalize_id("RELIC.NEOWS_TALISMAN", "relic") == "NEOWS_TALISMAN"

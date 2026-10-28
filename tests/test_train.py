@@ -1,13 +1,14 @@
 import json
 
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import pytest
 
 from sts2_advisor.features import OFFER_COLUMNS, SKIP
 from sts2_advisor.train import (
-    apply_train_filter, compare_top_picks, evaluate, main, pick_rate_scores, run,
-    split_data,
+    apply_train_filter, compare_top_picks, evaluate, fit_categories, main,
+    pick_rate_scores, predict, run, split_data, to_matrix,
 )
 
 
@@ -49,6 +50,27 @@ def test_apply_train_filter():
     assert apply_train_filter(df, {"won_only": True})["offer_id"].tolist() == ["a:1", "d:1"]
     assert apply_train_filter(df, {"won_only": True, "min_ascension": 5}
                               )["offer_id"].tolist() == ["d:1"]
+
+
+def test_relics_become_flag_columns():
+    train = pd.DataFrame(rows("a:1", ["X"], "X", relics_held="ANCHOR|VAJRA")
+                         + rows("b:1", ["X"], "X", relics_held="ANCHOR")
+                         + rows("c:1", ["X"], "X", relics_held=None))
+    cats = fit_categories(train)
+    assert cats["relics"] == ["ANCHOR", "VAJRA"]
+    test = pd.DataFrame(rows("d:1", ["X"], "X", relics_held="VAJRA|NEW_RELIC")
+                        + rows("e:1", ["X"], "X", relics_held=""))
+    X = to_matrix(test, cats)
+    assert X[["relic_ANCHOR", "relic_VAJRA"]].values.tolist() == [[0, 1], [0, 0]]
+    assert "relic_NEW_RELIC" not in X  # unseen in training: no column
+
+
+def test_relic_columns_capped(monkeypatch):
+    monkeypatch.setattr("sts2_advisor.train.MAX_RELIC_FEATURES", 2)
+    held = ["A|B|C", "A|B", "A"]  # A x3, B x2, C x1
+    train = pd.DataFrame(sum((rows(f"{i}:1", ["X"], "X", relics_held=h)
+                              for i, h in enumerate(held)), []))
+    assert fit_categories(train)["relics"] == ["A", "B"]
 
 
 def test_compare_top_picks():
@@ -147,6 +169,19 @@ def test_run_compares_with_saved_model(tmp_path):
     assert set(metrics) >= {"test", "test_won", "mine", "comparison"}
     assert 0.0 <= metrics["comparison"]["disagree"] <= 1.0
     assert metrics["test_won"]["model"]["n_offers"] < metrics["test"]["model"]["n_offers"]
+
+
+def test_predict_works_for_model_with_fewer_features():
+    """A model trained before a feature column existed still scores new data."""
+    df = synthetic_offers(n_runs=60)
+    cats = fit_categories(df)
+    X = to_matrix(df, cats).drop(columns=["cand_synergy"])
+    older = lgb.train({"objective": "lambdarank", "verbose": -1, "min_data_in_leaf": 5},
+                      lgb.Dataset(X, label=df["picked"].astype(int),
+                                  group=df.groupby("offer_id", sort=False).size().to_numpy()),
+                      num_boost_round=5)
+    assert "cand_synergy" not in older.feature_name()
+    assert len(predict(older, cats, df)) == len(df)
 
 
 def test_main_logs_to_mlflow(tmp_path, capsys):

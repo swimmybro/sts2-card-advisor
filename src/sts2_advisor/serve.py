@@ -24,19 +24,25 @@ import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from sts2_advisor.features import DEFAULT_CARD_META, SKIP, load_card_meta, reward_rows
+from sts2_advisor.features import (
+    DEFAULT_CARD_META, SKIP, load_card_meta, relic_fields, reward_rows,
+)
 from sts2_advisor.parse import OFFICIAL_CHARACTERS
 from sts2_advisor.train import load_model, predict
 
 DEFAULT_MODEL_DIR = Path("models/card_pick")
 
 
+def normalize_id(name: str, prefix: str) -> str:
+    """'Burning Blood' / 'RELIC.BURNING_BLOOD' -> 'BURNING_BLOOD' (prefix='relic')."""
+    name = re.sub(rf"^{prefix}\.", "", name.strip(), flags=re.IGNORECASE)
+    return re.sub(r"[\s']+", "_", name).upper()
+
+
 def normalize_card(name: str) -> Tuple[str, bool]:
     """'Shrug It Off+' / 'CARD.SHRUG_IT_OFF' -> ('SHRUG_IT_OFF', upgraded?)."""
     name = name.strip()
-    upgraded = name.endswith("+")
-    name = re.sub(r"^card\.", "", name.rstrip("+").strip(), flags=re.IGNORECASE)
-    return re.sub(r"[\s']+", "_", name).upper(), upgraded
+    return normalize_id(name.rstrip("+").strip(), "card"), name.endswith("+")
 
 
 class OfferedCard(BaseModel):
@@ -119,7 +125,8 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
             candidates.append({"id": cid, "upgraded": up or getattr(c, "upgraded", False)})
         base = {"character": req.character, "ascension": req.ascension, "act": req.act,
                 "floor": req.floor, "room_type": req.room_type, "hp": req.hp,
-                "max_hp": req.max_hp, "gold": req.gold, "n_relics": len(req.relics)}
+                "max_hp": req.max_hp, "gold": req.gold,
+                **relic_fields(normalize_id(r, "relic") for r in req.relics)}
         rows = pd.DataFrame(reward_rows(base, candidates, deck, meta))
         rows["score"] = predict(booster, categories, rows)
         rows = rows.sort_values("score", ascending=False)

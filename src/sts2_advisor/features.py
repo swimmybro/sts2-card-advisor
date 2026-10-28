@@ -17,6 +17,7 @@ import argparse
 import bisect
 import csv
 import logging
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +28,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from sts2_advisor.cards import TRAITS
 from sts2_advisor.parse import (
     DEFAULT_CARD_ALLOWLIST, ParseStats, _strip, iter_kept_runs, load_card_allowlist,
 )
@@ -36,6 +38,8 @@ log = logging.getLogger(__name__)
 DEFAULT_CARD_META = Path("configs/cards.csv")
 REWARD_ROOMS = {"monster", "elite", "boss"}
 SKIP = "SKIP"
+# 'OstyAttack' -> 'deck_osty_attack': how many deck cards have each trait.
+TRAIT_COLUMNS = {t: "deck_" + re.sub(r"(?<!^)(?=[A-Z])", "_", t).lower() for t in TRAITS}
 
 OFFER_SCHEMA = pa.schema([
     # identity / grouping
@@ -46,15 +50,19 @@ OFFER_SCHEMA = pa.schema([
     ("act", pa.int64()), ("floor", pa.int64()), ("room_type", pa.string()),
     ("hp", pa.int64()), ("max_hp", pa.int64()), ("hp_frac", pa.float64()),
     ("gold", pa.int64()), ("n_relics", pa.int64()),
+    ("relics_held", pa.string()),  # '|'-separated relic ids; expanded at training time
     # deck before the pick
     ("deck_size", pa.int64()), ("deck_attacks", pa.int64()),
     ("deck_skills", pa.int64()), ("deck_powers", pa.int64()),
-    ("deck_curses", pa.int64()),
+    ("deck_curses", pa.int64()), ("deck_basics", pa.int64()),
+    ("deck_avg_cost", pa.float64()),
+    *[(col, pa.int64()) for col in TRAIT_COLUMNS.values()],
     # candidate
     ("n_offered", pa.int64()), ("candidate", pa.string()), ("is_skip", pa.bool_()),
     ("cand_type", pa.string()), ("cand_rarity", pa.string()),
     ("cand_cost", pa.int64()), ("cand_upgraded", pa.bool_()),
     ("cand_copies_in_deck", pa.int64()),
+    ("cand_n_traits", pa.int64()), ("cand_synergy", pa.int64()),
     # labels
     ("picked", pa.bool_()), ("run_won", pa.bool_()), ("floors_reached", pa.int64()),
 ])
@@ -89,7 +97,9 @@ class FeatureStats:
 def load_card_meta(path: Path) -> Dict[str, dict]:
     with open(path, newline="", encoding="utf-8") as f:
         return {r["id"]: {"type": r["type"], "rarity": r["rarity"],
-                          "cost": int(r["cost"])} for r in csv.DictReader(f)}
+                          "cost": int(r["cost"]),
+                          "traits": frozenset(filter(None, (r.get("traits") or "").split("|")))}
+                for r in csv.DictReader(f)}
 
 
 def _deck_changes(stats: Dict[str, Any]) -> Counter:
@@ -119,16 +129,28 @@ def starting_deck(data: Dict[str, Any]) -> Counter:
     return +deck
 
 
-def _deck_features(deck: Counter, meta: Dict[str, dict]) -> Dict[str, int]:
+def _deck_features(deck: Counter, meta: Dict[str, dict]) -> Dict[str, Any]:
     by_type: Counter = Counter()
+    traits: Counter = Counter()
+    n_basic = cost_total = n_costed = 0
     for card, n in deck.items():
-        by_type[meta.get(card, {}).get("type")] += n
+        m = meta.get(card, {})
+        by_type[m.get("type")] += n
+        for t in m.get("traits", ()):
+            traits[t] += n
+        n_basic += n if m.get("rarity") == "Basic" else 0
+        if m.get("cost") is not None and m["cost"] >= 0:  # -1 = unplayable / X
+            cost_total += m["cost"] * n
+            n_costed += n
     return {
         "deck_size": sum(deck.values()),
         "deck_attacks": by_type["Attack"],
         "deck_skills": by_type["Skill"],
         "deck_powers": by_type["Power"],
         "deck_curses": by_type["Curse"] + by_type["Status"],
+        "deck_basics": n_basic,
+        "deck_avg_cost": cost_total / n_costed if n_costed else None,
+        **{col: traits[t] for t, col in TRAIT_COLUMNS.items()},
     }
 
 
@@ -150,18 +172,29 @@ def reward_rows(base: Dict[str, Any], candidates: List[Dict[str, Any]],
     rows = []
     for c in candidates:
         m = meta.get(c["id"], {})
+        traits = m.get("traits", frozenset())
         rows.append(dict(
             base, candidate=c["id"], is_skip=False,
             cand_type=m.get("type"), cand_rarity=m.get("rarity"), cand_cost=m.get("cost"),
             cand_upgraded=bool(c.get("upgraded")), cand_copies_in_deck=deck[c["id"]],
+            cand_n_traits=len(traits),
+            # deck cards sharing each of the candidate's traits, summed
+            cand_synergy=sum(base[TRAIT_COLUMNS[t]] for t in traits if t in TRAIT_COLUMNS),
             picked=bool(c.get("picked")),
         ))
     rows.append(dict(
         base, candidate=SKIP, is_skip=True, cand_type=None, cand_rarity=None,
         cand_cost=None, cand_upgraded=None, cand_copies_in_deck=None,
+        cand_n_traits=None, cand_synergy=None,
         picked=not any(c.get("picked") for c in candidates),
     ))
     return rows
+
+
+def relic_fields(relic_ids: Iterable[str]) -> Dict[str, Any]:
+    """``n_relics`` and ``relics_held`` for the relics held at a reward."""
+    ids = sorted(set(relic_ids))
+    return {"n_relics": len(ids), "relics_held": "|".join(ids)}
 
 
 def _group(data: Dict[str, Any], run_id: str) -> str:
@@ -186,7 +219,9 @@ def offer_rows(data: Dict[str, Any], run_id: str, source: str,
     player = data["players"][0]
     pid = player["id"]
     deck = starting_deck(data)
-    relic_floors = sorted(r.get("floor_added_to_deck", 0) for r in player.get("relics", []))
+    relics = sorted((r.get("floor_added_to_deck", 0), _strip(r["id"]))
+                    for r in player.get("relics", []))
+    relic_floors = [f for f, _ in relics]
     n_floors = sum(len(act) for act in data["map_point_history"])
     run_ctx = {
         "run_id": run_id, "source": source, "group": _group(data, run_id),
@@ -218,7 +253,8 @@ def offer_rows(data: Dict[str, Any], run_id: str, source: str,
                     offer_id=f"{run_id}:{floor}", act=act_idx, floor=floor,
                     room_type=point["map_point_type"], hp=hp, max_hp=max_hp,
                     gold=stats.get("current_gold"),
-                    n_relics=bisect.bisect_left(relic_floors, floor),
+                    # relics gained on earlier floors only
+                    **relic_fields(r for _, r in relics[:bisect.bisect_left(relic_floors, floor)]),
                 )
                 candidates = [
                     {"id": _strip(c["card"]["id"]),

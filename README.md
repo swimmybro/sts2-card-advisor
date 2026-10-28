@@ -52,9 +52,9 @@ This writes `data/processed/offers.parquet`: one row per card in each post-comba
 
 | Column group | Columns |
 | --- | --- |
-| Run context | `character`, `ascension`, `build_id`, `act`, `floor`, `room_type`, `hp`, `max_hp`, `hp_frac`, `gold`, `n_relics` |
-| Deck before the pick | `deck_size`, `deck_attacks`, `deck_skills`, `deck_powers`, `deck_curses` |
-| Candidate | `candidate`, `is_skip`, `cand_type`, `cand_rarity`, `cand_cost`, `cand_upgraded`, `cand_copies_in_deck`, `n_offered` |
+| Run context | `character`, `ascension`, `build_id`, `act`, `floor`, `room_type`, `hp`, `max_hp`, `hp_frac`, `gold`, `n_relics`, `relics_held` (`\|`-separated IDs) |
+| Deck before the pick | `deck_size`, `deck_attacks`, `deck_skills`, `deck_powers`, `deck_curses`, `deck_basics`, `deck_avg_cost`, plus one count per card trait (`deck_exhaust`, `deck_block`, `deck_strength`, …) |
+| Candidate | `candidate`, `is_skip`, `cand_type`, `cand_rarity`, `cand_cost`, `cand_upgraded`, `cand_copies_in_deck`, `cand_n_traits`, `cand_synergy`, `n_offered` |
 | Labels | `picked`; `run_won` (blank for abandoned runs); `floors_reached` |
 | Splitting | `group`: the player's `player_token` when known, otherwise the run |
 
@@ -63,7 +63,16 @@ How it works and what it leaves out:
 - **Deck rebuild:** the deck at each reward comes from replaying every logged gain, removal and transform from the starting deck. The starting deck is the final deck with all those changes undone. Runs where this doesn't add up are dropped.
 - **Dropped runs:** also any run with impossible HP (edited saves).
 - **Left-out rewards:** rewards with more than one pick, which are usually two reward screens logged together.
-- **Card metadata:** type, rarity and cost come from [`configs/cards.csv`](configs/cards.csv), a snapshot of Spire Codex's `/api/cards`.
+- **Card metadata:** type, rarity, cost and traits come from [`configs/cards.csv`](configs/cards.csv), a snapshot of Spire Codex's `/api/cards`. Refresh it after a game patch with `PYTHONPATH=src .venv/bin/python -m sts2_advisor.cards`.
+- **Card traits** (see [`cards.py`](src/sts2_advisor/cards.py)) describe each card's role:
+  - keywords: Exhaust, Ethereal, Retain, Innate, Sly
+  - tags: Strike, Defend, Shiv, Minion, OstyAttack
+  - effects applied: Strength, Vulnerable, Weak, Poison, Dexterity, Focus, Doom, Plating
+  - cards it creates: Soul, Sovereign Blade
+  - what it does: Block, Draw, Energy, HP loss, hits all enemies, X-cost
+
+  `cand_synergy` counts how many deck cards share a trait with the candidate.
+- **Relics:** `relics_held` lists the relics held *before* each reward. Training turns the 60 most common relics into individual 0/1 columns (`relic_<ID>`).
 - **Splitting:** use `features.split_by_group` for train/test splits, so no run (or player) lands on both sides.
 
 ## Training the card-pick model

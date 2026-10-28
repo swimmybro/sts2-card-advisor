@@ -20,19 +20,25 @@ from typing import Any, Dict, List, Optional, Tuple
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 import yaml
 
-from sts2_advisor.features import split_by_group
+from sts2_advisor.features import TRAIT_COLUMNS, split_by_group
 
 log = logging.getLogger(__name__)
 
 NUMERIC_FEATURES = [
     "ascension", "act", "floor", "hp_frac", "gold", "n_relics",
     "deck_size", "deck_attacks", "deck_skills", "deck_powers", "deck_curses",
-    "n_offered", "cand_cost", "cand_upgraded", "cand_copies_in_deck", "is_skip",
+    "deck_basics", "deck_avg_cost", *TRAIT_COLUMNS.values(),
+    "n_offered", "cand_cost", "cand_upgraded", "cand_copies_in_deck",
+    "cand_n_traits", "cand_synergy", "is_skip",
 ]
 CATEGORICAL_FEATURES = ["character", "candidate", "cand_type", "cand_rarity", "room_type"]
 FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
+# Relics get one 0/1 column each (relic_<ID>) for the most common ones in training.
+MAX_RELIC_FEATURES = 60
 EVAL_SPLITS = {"test": "Community test set",
                "test_won": "Community test set, winning runs only",
                "mine": "Your runs (held out)"}
@@ -40,7 +46,7 @@ EVAL_SPLITS = {"test": "Community test set",
 
 # --------------------------------------------------------------------------- data
 
-LOAD_COLUMNS = FEATURES + ["offer_id", "group", "source", "picked", "run_won"]
+LOAD_COLUMNS = FEATURES + ["relics_held", "offer_id", "group", "source", "picked", "run_won"]
 
 
 def load_offers(path: Path) -> pd.DataFrame:
@@ -54,7 +60,7 @@ def load_offers(path: Path) -> pd.DataFrame:
         # sort=True keeps the codes in string order, so row order and the
         # seeded train/test split don't depend on the file's row order.
         df[c] = pd.factorize(df[c], sort=True)[0].astype("int32")
-    for c in CATEGORICAL_FEATURES + ["source"]:
+    for c in CATEGORICAL_FEATURES + ["source", "relics_held"]:
         df[c] = df[c].astype("string[pyarrow]")
     numeric = [c for c in NUMERIC_FEATURES if c != "is_skip"]  # is_skip stays bool
     df[numeric] = df[numeric].astype("float32")
@@ -90,17 +96,38 @@ def apply_train_filter(df: pd.DataFrame, f: Dict[str, Any]) -> pd.DataFrame:
     return df[keep]
 
 
+def _split_relics(held: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
+    """('A|B', '', 'C') -> relic ids ['A','B','C'] and their row indices [0,0,2]."""
+    lists = pc.split_pattern(pa.array(held.fillna("").astype(str), pa.string()), "|")
+    flat = pc.list_flatten(lists).to_numpy(zero_copy_only=False)
+    rows = pc.list_parent_indices(lists).to_numpy()
+    keep = flat != ""
+    return flat[keep], rows[keep]
+
+
 def fit_categories(train: pd.DataFrame) -> Dict[str, List[str]]:
-    return {c: sorted(train[c].dropna().unique().tolist()) for c in CATEGORICAL_FEATURES}
+    cats = {c: sorted(train[c].dropna().unique().tolist()) for c in CATEGORICAL_FEATURES}
+    relics = pd.Series(_split_relics(train["relics_held"])[0]).value_counts()
+    cats["relics"] = sorted(relics.head(MAX_RELIC_FEATURES).index.tolist())
+    return cats
 
 
 def to_matrix(df: pd.DataFrame, categories: Dict[str, List[str]]) -> pd.DataFrame:
-    """Feature matrix with categories fixed to the training set (unseen -> NaN)."""
+    """Feature matrix with categories fixed to the training set (unseen -> NaN),
+    plus a 0/1 column per tracked relic."""
     X = df[FEATURES].copy()
     for c in NUMERIC_FEATURES:
         X[c] = X[c].astype("float32")
     for c in CATEGORICAL_FEATURES:
         X[c] = pd.Categorical(X[c], categories=categories[c])
+    tracked = categories.get("relics", [])
+    if tracked:
+        ids, rows = _split_relics(df["relics_held"])
+        col = pd.Categorical(ids, categories=tracked).codes
+        flags = np.zeros((len(df), len(tracked)), dtype=np.float32)
+        flags[rows[col >= 0], col[col >= 0]] = 1.0
+        X = pd.concat([X, pd.DataFrame(flags, index=X.index,
+                                       columns=[f"relic_{r}" for r in tracked])], axis=1)
     return X
 
 
@@ -197,7 +224,9 @@ def train_ranker(train: pd.DataFrame, valid: pd.DataFrame, cfg: Dict[str, Any]
 
 def predict(booster: lgb.Booster, categories: Dict[str, List[str]],
             df: pd.DataFrame) -> np.ndarray:
-    return booster.predict(to_matrix(df, categories), num_iteration=booster.best_iteration)
+    # Select the booster's own columns so models trained on fewer features still work.
+    X = to_matrix(df, categories)[booster.feature_name()]
+    return booster.predict(X, num_iteration=booster.best_iteration)
 
 
 def save_model(booster: lgb.Booster, categories: Dict[str, List[str]],
