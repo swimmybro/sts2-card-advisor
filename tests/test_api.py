@@ -3,21 +3,38 @@ from fastapi.testclient import TestClient
 
 from sts2_advisor.serve import create_app, normalize_card, normalize_id
 from sts2_advisor.train import run
+from sts2_advisor.win import run as run_win
 from test_train import config, synthetic_offers
+from test_win import win_config
 
 
 @pytest.fixture(scope="module")
-def client(tmp_path_factory):
-    """API over a small model trained on synthetic rewards where GOOD is always
-    taken, and with no GOOD the player skips at low HP."""
+def trained(tmp_path_factory):
+    """A small pick model trained on synthetic rewards where GOOD is always
+    taken, and with no GOOD the player skips at low HP; plus a win model."""
     tmp = tmp_path_factory.mktemp("api")
     synthetic_offers().to_parquet(tmp / "offers.parquet")
     run(config(tmp))
+    run_win(win_config(tmp))
     meta = tmp / "cards.csv"  # costs must match synthetic_offers' cand_cost
     meta.write_text("id,type,rarity,color,cost,is_x_cost\n" + "".join(
         f"{c},Attack,Common,ironclad,{cost},False\n"
         for c, cost in {"GOOD": 1, "A": 0, "B": 1, "C": 2, "D": 2, "E": 3}.items()))
-    return TestClient(create_app(model_dir=tmp / "model", card_meta=meta))
+    return tmp, meta
+
+
+@pytest.fixture(scope="module")
+def client(trained):
+    tmp, meta = trained
+    return TestClient(create_app(model_dir=tmp / "model", card_meta=meta,
+                                 win_model_dir=tmp / "no_win_model"))
+
+
+@pytest.fixture(scope="module")
+def win_client(trained):
+    tmp, meta = trained
+    return TestClient(create_app(model_dir=tmp / "model", card_meta=meta,
+                                 win_model_dir=tmp / "win"))
 
 
 def state(**kw):
@@ -29,6 +46,23 @@ def state(**kw):
 def test_health(client):
     body = client.get("/health").json()
     assert body["status"] == "ok" and body["best_iteration"] is not None
+    assert body["win_model_dir"] is None
+
+
+def test_no_win_model_means_no_win_fields(client):
+    body = client.post("/rank", json=state()).json()
+    assert body["win_suggestion"] is None
+    assert all(r["win_chance"] is None for r in body["ranking"])
+
+
+def test_win_chance_per_option(win_client):
+    assert win_client.get("/health").json()["win_model_dir"].endswith("win")
+    body = win_client.post("/rank", json=state()).json()
+    chances = {r["card"]: r["win_chance"] for r in body["ranking"]}
+    assert set(chances) == {"GOOD", "A", "B", "SKIP"}
+    assert all(0.0 <= c <= 1.0 for c in chances.values())
+    assert body["win_suggestion"] == max(chances, key=chances.get)
+    assert body["suggestion"] == "GOOD"  # pick-model suggestion unchanged
 
 
 def test_rank_suggests_learned_pick(client):

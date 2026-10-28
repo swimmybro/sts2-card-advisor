@@ -1,0 +1,30 @@
+# Win-probability model (python -m sts2_advisor.win --config configs/win.yaml --pick-model models/card_pick)
+
+data:
+  offers: data/processed/offers.parquet
+
+# Keep identical to configs/train.yaml so both models share the same test sets.
+split:
+  test_frac: 0.2
+  valid_frac: 0.1
+  seed: 0
+  hold_out_mine: true
+
+model:
+  objective: binary
+  metric: binary_logloss
+  learning_rate: 0.05
+  num_leaves: 63
+  min_data_in_leaf: 200
+  feature_fraction: 0.9
+  num_boost_round: 3000
+  early_stopping_rounds: 50
+
+output:
+  model_dir: models/win_prob
+
+mlflow:
+  enabled: true
+  db_path: mlruns/mlflow.db
+  artifact_dir: mlruns/artifacts
+  experiment: win-prob

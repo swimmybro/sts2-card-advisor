@@ -109,6 +109,26 @@ The report adds:
 - **`win: followed` / `win: not`:** how often runs were won when the player's pick agreed or disagreed with the method's top choice. Treat this as a hint, not proof. Strong players win more *and* pick differently, so the gap mixes skill with pick quality.
 - **Comparison:** with `--compare-with`, how often the two models' top picks differ, and which cards each favours.
 
+## Win-probability model
+
+The pick model copies what players choose. The win model instead ranks options by how often taking them was followed by a win.
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.win --config configs/win.yaml --pick-model models/card_pick
+```
+
+- **Training data:** the option each player actually picked at each reward, labelled with whether the run was won. Abandoned runs are left out. It uses the same features as the pick model: the state before the pick plus the picked option's details.
+- **Ranking a reward:** every option, including `SKIP`, is scored with the same model ("if you take this, how likely is a win?").
+- **Same test sets:** [`configs/win.yaml`](configs/win.yaml) uses the same split as `train.yaml`.
+- **Report:**
+  - outcome prediction: AUC, log loss, Brier score, and calibration (predicted vs actual win rate)
+  - how often its top option matches the player's pick and the pick model's
+  - how often it suggests skipping, and how big the gap is between a reward's best and worst options
+  - which cards it favours more or less than players do
+- **Output:** saved to `models/win_prob/` and logged to MLflow under the `win-prob` experiment.
+
+It learns from outcomes, but it's still correlational. Stronger players both win more and pick differently, so a card can look good partly because good players take it.
+
 ## Card advisor API
 
 Serve the trained model over HTTP:
@@ -117,7 +137,7 @@ Serve the trained model over HTTP:
 .venv/bin/uvicorn --factory sts2_advisor.serve:create_app --app-dir src --port 8000
 ```
 
-`MODEL_DIR` (default `models/card_pick`) and `CARD_META` (default `configs/cards.csv`) choose the model and card list. Interactive docs are at http://127.0.0.1:8000/docs.
+`MODEL_DIR` (default `models/card_pick`) and `CARD_META` (default `configs/cards.csv`) choose the pick model and card list. `WIN_MODEL_DIR` (default `models/win_prob`) points to the optional win model. If it exists, each option also gets a `win_chance`, and the response gets a `win_suggestion`. Interactive docs are at http://127.0.0.1:8000/docs.
 
 - `GET /health`: confirms the server is up and shows which model is loaded.
 - `POST /rank`: send the current state and the offered cards; get them back ranked, plus `SKIP`:

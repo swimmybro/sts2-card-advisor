@@ -20,6 +20,7 @@ from collections import Counter
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple, Union
 
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -31,6 +32,7 @@ from sts2_advisor.parse import OFFICIAL_CHARACTERS
 from sts2_advisor.train import load_model, predict
 
 DEFAULT_MODEL_DIR = Path("models/card_pick")
+DEFAULT_WIN_MODEL_DIR = Path("models/win_prob")
 
 
 def normalize_id(name: str, prefix: str) -> str:
@@ -85,24 +87,32 @@ class RankedCard(BaseModel):
     card: str
     upgraded: bool
     is_skip: bool
-    score: float
+    score: float = Field(description="Pick-model score: how likely players are to take it")
+    win_chance: Optional[float] = Field(
+        None, description="Win model: predicted chance of winning the run if you take it")
     known: bool = Field(description="False if the model never saw this card in training")
 
 
 class RankResponse(BaseModel):
-    suggestion: str
+    suggestion: str = Field(description="Top option by the pick model")
+    win_suggestion: Optional[str] = Field(
+        None, description="Top option by predicted win chance (if a win model is loaded)")
     ranking: List[RankedCard]
     unknown_cards: List[str]
 
 
-def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = None) -> FastAPI:
-    """Build the app. Paths default to ``$MODEL_DIR`` / ``$CARD_META``."""
+def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = None,
+               win_model_dir: Optional[Path] = None) -> FastAPI:
+    """Build the app. Paths default to ``$MODEL_DIR``, ``$CARD_META`` and
+    ``$WIN_MODEL_DIR``; the win model is optional and skipped if missing."""
     model_dir = Path(model_dir or os.environ.get("MODEL_DIR", DEFAULT_MODEL_DIR))
     meta = load_card_meta(Path(card_meta or os.environ.get("CARD_META", DEFAULT_CARD_META)))
     booster, categories = load_model(model_dir)
+    win_dir = Path(win_model_dir or os.environ.get("WIN_MODEL_DIR", DEFAULT_WIN_MODEL_DIR))
+    win = load_model(win_dir) if (win_dir / "model.txt").exists() else None
     known_cards = set(categories["candidate"])
     metrics_path = model_dir / "metrics.json"
-    model_info = {"model_dir": str(model_dir)}
+    model_info = {"model_dir": str(model_dir), "win_model_dir": str(win_dir) if win else None}
     if metrics_path.exists():
         m = json.loads(metrics_path.read_text())
         model_info.update(best_iteration=m.get("best_iteration"),
@@ -129,15 +139,18 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
                 **relic_fields(normalize_id(r, "relic") for r in req.relics)}
         rows = pd.DataFrame(reward_rows(base, candidates, deck, meta))
         rows["score"] = predict(booster, categories, rows)
+        rows["win_chance"] = predict(*win, rows) if win else np.nan
         rows = rows.sort_values("score", ascending=False)
         ranking = [
             RankedCard(card=r.candidate, upgraded=bool(r.cand_upgraded) if not r.is_skip else False,
                        is_skip=bool(r.is_skip), score=round(float(r.score), 4),
+                       win_chance=None if np.isnan(r.win_chance) else round(float(r.win_chance), 4),
                        known=bool(r.is_skip) or r.candidate in known_cards)
             for r in rows.itertuples()
         ]
         return RankResponse(
             suggestion=ranking[0].card,
+            win_suggestion=(rows.loc[rows["win_chance"].idxmax(), "candidate"] if win else None),
             ranking=ranking,
             unknown_cards=sorted({c["id"] for c in candidates} - known_cards),
         )

@@ -304,7 +304,20 @@ def run(cfg: Dict[str, Any], compare_with: Optional[Path] = None) -> Dict[str, A
 
 
 def _log_mlflow(cfg: Dict[str, Any], metrics: Dict[str, Any], model_dir: Path) -> None:
-    """Log to a SQLite-backed MLflow store (newer MLflow rejects plain folders)."""
+    flat = {"best_iteration": metrics["best_iteration"]}
+    for split in EVAL_SPLITS:
+        for method, vals in metrics.get(split, {}).items():
+            for k, v in vals.items():
+                if k != "n_offers":
+                    flat[f"{split}.{method}.{k}"] = v
+    if "comparison" in metrics:
+        flat["comparison.disagree"] = metrics["comparison"]["disagree"]
+    log_to_mlflow(cfg, flat, model_dir)
+
+
+def log_to_mlflow(cfg: Dict[str, Any], flat_metrics: Dict[str, float], model_dir: Path) -> None:
+    """Log config params, flat metrics and the model files to a SQLite-backed
+    MLflow store (newer MLflow rejects plain folders)."""
     import mlflow
 
     m = cfg["mlflow"]
@@ -320,14 +333,9 @@ def _log_mlflow(cfg: Dict[str, Any], metrics: Dict[str, Any], model_dir: Path) -
         mlflow.log_params({f"split.{k}": v for k, v in cfg["split"].items()})
         mlflow.log_params({f"train_filter.{k}": v
                            for k, v in (cfg.get("train_filter") or {}).items()})
-        mlflow.log_metric("best_iteration", metrics["best_iteration"])
-        for split in EVAL_SPLITS:
-            for method, vals in metrics.get(split, {}).items():
-                for k, v in vals.items():
-                    if k != "n_offers" and not np.isnan(v):
-                        mlflow.log_metric(f"{split}.{method}.{k}", v)
-        if "comparison" in metrics:
-            mlflow.log_metric("comparison.disagree", metrics["comparison"]["disagree"])
+        for k, v in flat_metrics.items():
+            if v is not None and not np.isnan(v):
+                mlflow.log_metric(k, v)
         mlflow.log_artifacts(str(model_dir))
 
 
