@@ -213,6 +213,38 @@ It ends with how often you agreed with each model, and the rewards where the win
 
 Your own runs are held out from training, so the models are judging picks they haven't seen. Scoring uses the same code as the API ([`advise.py`](src/sts2_advisor/advise.py)).
 
+## Monitoring for drift
+
+`monitor.py` checks whether the models still fit recent runs, for example after a game patch.
+
+Check a newer community export:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.monitor data/external/runs-v0.112.0.jsonl.gz
+```
+
+Check your runs played since the models were trained:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.monitor data/raw --since-model
+```
+
+Pass run files or folders (`.run` or `.jsonl.gz`). `--since YYYY-MM-DD` or `--since-model` limits the check to runs started after a date, or after the pick model was trained.
+
+Recent runs are compared like with like. Community runs are compared with the community data the models learned from. Your own runs are compared with your earlier runs. Each check reports `ok`, `drift`, `low data` or `info`:
+
+| Check | Flags drift when |
+| --- | --- |
+| New cards | a card missing from the allowlist appears in ≥ 1% of runs. That's probably a real new card, since mod cards each appear in only a few runs. Add it to `configs/official_cards.txt` and refresh `configs/cards.csv`. |
+| Game version | runs are on a version the models weren't trained on |
+| Pick rates | ≥ 5 cards' pick rates move ≥ 10 points (with ≥ 100 offers on both sides), or the skip rate moves ≥ 5 points. For your own runs this is `info` only: retraining on community data can't follow your play style. |
+| Pick-model accuracy | top-1 drops ≥ 3 points below the training-time test result for the same group (community or your runs), and by more than chance variation alone could explain |
+| Win-model calibration | how far average predicted win chance is from the actual win rate changes by ≥ 5 points compared with training time, or AUC drops ≥ 0.05 |
+
+Thresholds are in [`configs/monitor.yaml`](configs/monitor.yaml). The report ends with a verdict: "models look fine", "retrain recommended" (with reasons), or "too little recent data". `--json FILE` saves the full result, and `--fail-on-drift` exits with status 1 on drift, for scheduled jobs.
+
+The win model's chances are calibrated to community players. For a player who wins less often than average, they run high: on the author's runs, it predicts 37% against an actual 15%. That's stable rather than drift, and the ranking still works (AUC 0.79).
+
 ## Tests
 
 ```bash

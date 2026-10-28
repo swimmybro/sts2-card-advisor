@@ -1,0 +1,16 @@
+# Drift checks (python -m sts2_advisor.monitor RUNS... --config configs/monitor.yaml)
+
+reference:
+  offers: data/processed/offers.parquet  # the data the models were trained on
+
+thresholds:
+  min_runs: 50              # fewer recent runs than this: report "too little data"
+  min_rewards: 200          # same, for accuracy / calibration checks
+  new_card_run_share: 0.01  # an unlisted card in >= 1% of runs is probably a real new card
+  pick_rate_shift: 0.10     # a card's pick rate moving this much (with enough offers) ...
+  min_card_offers: 100      # ... counts once it was offered at least this often recently
+  shifted_cards: 5          # flag when this many cards shifted
+  skip_rate_shift: 0.05
+  top1_drop: 0.03           # pick-model top-1 below its test result by this much
+  calibration_gap: 0.05     # |mean predicted win chance - actual win rate|
+  auc_drop: 0.05
