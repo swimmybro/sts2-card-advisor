@@ -5,7 +5,10 @@ import pandas as pd
 import pytest
 
 from sts2_advisor.features import OFFER_COLUMNS, SKIP
-from sts2_advisor.train import evaluate, main, pick_rate_scores, run
+from sts2_advisor.train import (
+    apply_train_filter, compare_top_picks, evaluate, main, pick_rate_scores, run,
+    split_data,
+)
 
 
 def rows(offer_id, cands, picked, **ctx):
@@ -25,6 +28,34 @@ def test_evaluate_hand_checked():
 
     m = evaluate(df, np.array([0.1, 0.9, 0.0, 0.0, 0.1, 0.5]))
     assert m["top1"] == 1.0 and m["skip_precision"] == 1.0 and m["skip_recall"] == 1.0
+    assert np.isnan(m["win_if_followed"])  # no run outcomes in this data
+
+
+def test_evaluate_win_rates_by_agreement():
+    df = pd.DataFrame(rows("a:1", ["X", "Y"], "X", run_won=True)
+                      + rows("b:1", ["X", "Y"], "X", run_won=False)
+                      + rows("c:1", ["X", "Y"], "Y", run_won=False)
+                      + rows("d:1", ["X", "Y"], "Y", run_won=None))  # abandoned: ignored
+    m = evaluate(df, np.array([1, 0] * 4))  # always suggests X
+    assert m["win_if_followed"] == 0.5 and m["win_if_not"] == 0.0
+
+
+def test_apply_train_filter():
+    df = pd.DataFrame(rows("a:1", ["X"], "X", run_won=True, ascension=2)
+                      + rows("b:1", ["X"], "X", run_won=False, ascension=9)
+                      + rows("c:1", ["X"], "X", run_won=None, ascension=9)
+                      + rows("d:1", ["X"], "X", run_won=True, ascension=9))
+    assert apply_train_filter(df, {})["offer_id"].tolist() == ["a:1", "b:1", "c:1", "d:1"]
+    assert apply_train_filter(df, {"won_only": True})["offer_id"].tolist() == ["a:1", "d:1"]
+    assert apply_train_filter(df, {"won_only": True, "min_ascension": 5}
+                              )["offer_id"].tolist() == ["d:1"]
+
+
+def test_compare_top_picks():
+    df = pd.DataFrame(rows("a:1", ["X", "Y"], "X") + rows("b:1", ["X", "Y"], "X"))
+    c = compare_top_picks(df, np.array([0, 1, 1, 0]), np.array([1, 0, 1, 0]))
+    assert c["disagree"] == 0.5
+    assert c["more_often"] == {"Y": 0.5} and c["less_often"] == {"X": -0.5}
 
 
 def test_pick_rate_scores_with_character_fallback():
@@ -47,6 +78,7 @@ def synthetic_offers(n_runs=300, seed=0):
     out = []
     for r in range(n_runs):
         source = "mine" if r < 20 else "codex"
+        won = bool(r % 2)
         for floor in range(1, 6):
             cands = list(rng.choice(pool, size=3, replace=False))
             hp = float(rng.random())
@@ -57,7 +89,8 @@ def synthetic_offers(n_runs=300, seed=0):
             else:
                 pick = min(cands, key=cost.get)
             for row in rows(f"r{r}:{floor}", cands + [SKIP], pick, source=source,
-                            hp_frac=hp, floor=floor, act=1, ascension=5, n_offered=3):
+                            hp_frac=hp, floor=floor, act=1, ascension=5, n_offered=3,
+                            run_won=won):
                 row["cand_cost"] = cost.get(row["candidate"])
                 out.append(row)
     return pd.DataFrame(out, columns=OFFER_COLUMNS)
@@ -89,6 +122,31 @@ def test_run_learns_planted_pattern(tmp_path):
     assert metrics["mine"]["model"]["top1"] > 0.9
     for f in ("model.txt", "categories.json", "metrics.json"):
         assert (tmp_path / "model" / f).exists()
+
+
+def test_train_filter_leaves_test_sets_unchanged(tmp_path):
+    df = synthetic_offers(n_runs=100)
+    cfg = config(tmp_path)
+    base = split_data(df, cfg)
+    filtered = split_data(df, dict(cfg, train_filter={"won_only": True}))
+    assert filtered["train"]["run_won"].all()
+    assert len(filtered["train"]) < len(base["train"])
+    for split in ("test", "mine"):
+        assert filtered[split]["offer_id"].tolist() == base[split]["offer_id"].tolist()
+
+
+def test_run_compares_with_saved_model(tmp_path):
+    synthetic_offers().to_parquet(tmp_path / "offers.parquet")
+    run(config(tmp_path))  # saves the baseline model to tmp_path/model
+    cfg = config(tmp_path)
+    cfg["train_filter"] = {"won_only": True}
+    cfg["output"]["model_dir"] = str(tmp_path / "winners")
+    metrics = run(cfg, compare_with=tmp_path / "model")
+
+    assert metrics["n_offers"]["train"] < metrics["n_offers"]["test"] * 4
+    assert set(metrics) >= {"test", "test_won", "mine", "comparison"}
+    assert 0.0 <= metrics["comparison"]["disagree"] <= 1.0
+    assert metrics["test_won"]["model"]["n_offers"] < metrics["test"]["model"]["n_offers"]
 
 
 def test_main_logs_to_mlflow(tmp_path, capsys):

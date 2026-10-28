@@ -9,6 +9,11 @@ split:
   seed: 0
   hold_out_mine: true # evaluate on your own runs separately; never train on them
 
+# Which rewards to learn from (train/valid only; test sets are never filtered).
+train_filter:
+  won_only: false
+  min_ascension: null
+
 model:
   objective: lambdarank
   learning_rate: 0.05

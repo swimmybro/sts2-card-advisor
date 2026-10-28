@@ -33,6 +33,9 @@ NUMERIC_FEATURES = [
 ]
 CATEGORICAL_FEATURES = ["character", "candidate", "cand_type", "cand_rarity", "room_type"]
 FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
+EVAL_SPLITS = {"test": "Community test set",
+               "test_won": "Community test set, winning runs only",
+               "mine": "Your runs (held out)"}
 
 
 # --------------------------------------------------------------------------- data
@@ -45,13 +48,29 @@ def load_offers(path: Path) -> pd.DataFrame:
 
 def split_data(df: pd.DataFrame, cfg: Dict[str, Any]
                ) -> Dict[str, pd.DataFrame]:
-    """Return train / valid / test (community) and mine (your runs) frames."""
+    """Return train / valid / test (community) and mine (your runs) frames.
+
+    ``train_filter`` narrows train and valid only, so models trained with
+    different filters are scored on exactly the same test sets.
+    """
     s = cfg["split"]
     mine = df[df["source"] == "mine"] if s.get("hold_out_mine", True) else df.iloc[:0]
     rest = df.drop(mine.index)
     train, test = split_by_group(rest, s["test_frac"], s["seed"])
     train, valid = split_by_group(train, s["valid_frac"], s["seed"] + 1)
+    f = cfg.get("train_filter") or {}
+    train, valid = apply_train_filter(train, f), apply_train_filter(valid, f)
     return {"train": train, "valid": valid, "test": test, "mine": mine}
+
+
+def apply_train_filter(df: pd.DataFrame, f: Dict[str, Any]) -> pd.DataFrame:
+    """Keep only rewards from won runs and/or runs at or above an ascension."""
+    keep = pd.Series(True, index=df.index)
+    if f.get("won_only"):
+        keep &= df["run_won"].fillna(False).astype(bool)
+    if f.get("min_ascension") is not None:
+        keep &= df["ascension"] >= f["min_ascension"]
+    return df[keep]
 
 
 def fit_categories(train: pd.DataFrame) -> Dict[str, List[str]]:
@@ -74,21 +93,39 @@ def group_sizes(df: pd.DataFrame) -> np.ndarray:
 
 # ---------------------------------------------------------------------- metrics
 
-def evaluate(df: pd.DataFrame, scores: np.ndarray) -> Dict[str, float]:
-    """Top-1 accuracy, mean reciprocal rank, and skip precision / recall."""
+def top_picks(df: pd.DataFrame, scores: np.ndarray) -> pd.DataFrame:
+    """One row per reward: the top-scored candidate and whether it was the pick."""
     d = pd.DataFrame({"offer_id": df["offer_id"].to_numpy(),
+                      "candidate": df["candidate"].to_numpy(),
                       "picked": df["picked"].to_numpy(),
-                      "is_skip": df["is_skip"].to_numpy(), "score": scores})
-    top = d.loc[d.groupby("offer_id", sort=False)["score"].idxmax()]
+                      "is_skip": df["is_skip"].to_numpy(),
+                      "run_won": df["run_won"].to_numpy(), "score": scores})
+    return d.loc[d.groupby("offer_id", sort=False)["score"].idxmax()].set_index("offer_id")
+
+
+def evaluate(df: pd.DataFrame, scores: np.ndarray) -> Dict[str, float]:
+    """Top-1 accuracy, mean reciprocal rank, skip precision / recall, and
+    the win rate of runs when the player's pick agreed / disagreed with ours.
+
+    The win rates are correlations, not proof that a pick causes wins.
+    """
+    top = top_picks(df, scores)
+    d = pd.DataFrame({"offer_id": df["offer_id"].to_numpy(),
+                      "picked": df["picked"].to_numpy(), "score": scores})
     rank = d.groupby("offer_id", sort=False)["score"].rank(ascending=False, method="first")
-    actual_skip = d[d["picked"]].set_index("offer_id")["is_skip"]
-    pred_skip = top.set_index("offer_id")["is_skip"].reindex(actual_skip.index)
+    actual_skip = df[df["picked"].to_numpy()].set_index("offer_id")["is_skip"]
+    pred_skip = top["is_skip"].reindex(actual_skip.index)
     tp = (pred_skip & actual_skip).sum()
+    labelled = top[top["run_won"].notna()]
+    won = labelled["run_won"].astype(bool)
+    followed = labelled["picked"].astype(bool)
     return {
         "top1": float(top["picked"].mean()),
         "mrr": float((1.0 / rank[d["picked"]]).mean()),
         "skip_precision": float(tp / pred_skip.sum()) if pred_skip.sum() else 0.0,
         "skip_recall": float(tp / actual_skip.sum()) if actual_skip.sum() else 0.0,
+        "win_if_followed": float(won[followed].mean()) if followed.any() else float("nan"),
+        "win_if_not": float(won[~followed].mean()) if (~followed).any() else float("nan"),
         "n_offers": int(len(top)),
     }
 
@@ -154,11 +191,32 @@ def save_model(booster: lgb.Booster, categories: Dict[str, List[str]],
     (model_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
 
+def load_model(model_dir: Path) -> Tuple[lgb.Booster, Dict[str, List[str]]]:
+    booster = lgb.Booster(model_file=str(model_dir / "model.txt"))
+    categories = json.loads((model_dir / "categories.json").read_text())
+    return booster, categories
+
+
+def compare_top_picks(df: pd.DataFrame, ours: np.ndarray, theirs: np.ndarray,
+                      n_cards: int = 8) -> Dict[str, Any]:
+    """How often two models' top picks differ, and which picks shift most."""
+    a, b = top_picks(df, ours), top_picks(df, theirs)
+    share_a = a["candidate"].value_counts(normalize=True)
+    share_b = b["candidate"].value_counts(normalize=True)
+    shift = share_a.subtract(share_b, fill_value=0).sort_values()
+    return {
+        "disagree": float((a["candidate"] != b["candidate"]).mean()),
+        "more_often": {k: round(float(v), 4) for k, v in shift[::-1].head(n_cards).items() if v > 0},
+        "less_often": {k: round(float(v), 4) for k, v in shift.head(n_cards).items() if v < 0},
+    }
+
+
 # ------------------------------------------------------------------------- main
 
-def run(cfg: Dict[str, Any]) -> Dict[str, Any]:
+def run(cfg: Dict[str, Any], compare_with: Optional[Path] = None) -> Dict[str, Any]:
     df = load_offers(Path(cfg["data"]["offers"]))
     parts = split_data(df, cfg)
+    parts["test_won"] = parts["test"][parts["test"]["run_won"].fillna(False).astype(bool)]
     train, valid = parts["train"], parts["valid"]
     log.info("offers: %s", {k: v["offer_id"].nunique() for k, v in parts.items()})
 
@@ -171,15 +229,22 @@ def run(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "model": lambda d: predict(booster, categories, d),
     }
     metrics: Dict[str, Any] = {"best_iteration": booster.best_iteration,
+                               "train_filter": cfg.get("train_filter") or {},
                                "n_offers": {k: int(v["offer_id"].nunique())
                                             for k, v in parts.items()}}
-    for split in ("test", "mine"):
+    for split in EVAL_SPLITS:
         d = parts[split]
         if d.empty:
             continue
         metrics[split] = {name: evaluate(d, f(d)) for name, f in methods.items()}
-    metrics["test_by_character"] = evaluate_by_character(
-        parts["test"], predict(booster, categories, parts["test"]))
+    test_scores = predict(booster, categories, parts["test"])
+    metrics["test_by_character"] = evaluate_by_character(parts["test"], test_scores)
+    if compare_with is not None:
+        other, other_cats = load_model(compare_with)
+        metrics["comparison"] = dict(
+            compare_top_picks(parts["test"], test_scores,
+                              predict(other, other_cats, parts["test"])),
+            against=str(compare_with))
     gain = booster.feature_importance("gain")
     metrics["feature_importance"] = dict(sorted(
         zip(booster.feature_name(), (gain / gain.sum()).round(4).tolist()),
@@ -203,30 +268,49 @@ def _log_mlflow(cfg: Dict[str, Any], metrics: Dict[str, Any], model_dir: Path) -
         mlflow.create_experiment(m["experiment"],
                                  artifact_location=Path(m["artifact_dir"]).resolve().as_uri())
     mlflow.set_experiment(m["experiment"])
-    with mlflow.start_run():
+    with mlflow.start_run(run_name=m.get("run_name")):
         mlflow.log_params({f"model.{k}": v for k, v in cfg["model"].items()})
         mlflow.log_params({f"split.{k}": v for k, v in cfg["split"].items()})
+        mlflow.log_params({f"train_filter.{k}": v
+                           for k, v in (cfg.get("train_filter") or {}).items()})
         mlflow.log_metric("best_iteration", metrics["best_iteration"])
-        for split in ("test", "mine"):
+        for split in EVAL_SPLITS:
             for method, vals in metrics.get(split, {}).items():
                 for k, v in vals.items():
-                    if k != "n_offers":
+                    if k != "n_offers" and not np.isnan(v):
                         mlflow.log_metric(f"{split}.{method}.{k}", v)
+        if "comparison" in metrics:
+            mlflow.log_metric("comparison.disagree", metrics["comparison"]["disagree"])
         mlflow.log_artifacts(str(model_dir))
 
 
 def report(metrics: Dict[str, Any]) -> str:
     n = metrics["n_offers"]
-    lines = [f"Rewards: train {n['train']}, valid {n['valid']}, test {n['test']}, "
-             f"mine {n['mine']}   (best iteration: {metrics['best_iteration']})"]
-    for split, title in (("test", "Community test set"), ("mine", "Your runs (held out)")):
+    f = metrics.get("train_filter") or {}
+    lines = [f"Rewards: train {n['train']}, valid {n['valid']}, test {n['test']} "
+             f"({n['test_won']} from won runs), mine {n['mine']}   "
+             f"(best iteration: {metrics['best_iteration']})",
+             f"Training filter: {f if any(v for v in f.values()) else 'none (all runs)'}"]
+    for split, title in EVAL_SPLITS.items():
         if split not in metrics:
             continue
         lines += ["", f"{title}:",
-                  f"  {'method':<24} {'top-1':>7} {'MRR':>7} {'skip prec':>10} {'skip rec':>9}"]
+                  f"  {'method':<24} {'top-1':>7} {'MRR':>7} {'skip prec':>10} "
+                  f"{'skip rec':>9} {'win: followed':>14} {'win: not':>9}"]
         for method, m in metrics[split].items():
+            # Every run in test_won was won, so its win columns carry no information.
+            wins = (f"{'—':>14} {'—':>9}" if split == "test_won" else
+                    f"{m['win_if_followed']:14.1%} {m['win_if_not']:9.1%}")
             lines.append(f"  {method:<24} {m['top1']:7.1%} {m['mrr']:7.3f} "
-                         f"{m['skip_precision']:10.1%} {m['skip_recall']:9.1%}")
+                         f"{m['skip_precision']:10.1%} {m['skip_recall']:9.1%} {wins}")
+    if "comparison" in metrics:
+        c = metrics["comparison"]
+        lines += ["", f"Compared with {c['against']} (community test set):",
+                  f"  Top picks differ on {c['disagree']:.1%} of rewards",
+                  "  Picked more often by this model: " + ", ".join(
+                      f"{k} (+{v:.1%})" for k, v in c["more_often"].items()),
+                  "  Picked less often by this model: " + ", ".join(
+                      f"{k} ({v:.1%})" for k, v in c["less_often"].items())]
     lines += ["", "Model top-1 by character (community test):"]
     for ch, m in sorted(metrics["test_by_character"].items()):
         lines.append(f"  {ch:<12} {m['top1']:6.1%}  ({m['n_offers']} rewards)")
@@ -239,12 +323,14 @@ def report(metrics: Dict[str, Any]) -> str:
 def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", type=Path, default=Path("configs/train.yaml"))
+    ap.add_argument("--compare-with", type=Path, metavar="MODEL_DIR",
+                    help="a saved model to compare top picks against on the test set")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(levelname)s %(message)s")
     cfg = yaml.safe_load(args.config.read_text())
-    metrics = run(cfg)
+    metrics = run(cfg, compare_with=args.compare_with)
     print(report(metrics))
     print(f"\nSaved model to {cfg['output']['model_dir']}")
 

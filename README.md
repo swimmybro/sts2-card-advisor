@@ -86,6 +86,20 @@ This trains a LightGBM ranker on `offers.parquet`. Within each reward it scores 
 
 The model learns which card players *pick*, not which pick *wins*. It matches community choices, which are not necessarily the best ones.
 
+### Training on winning runs only
+
+`train_filter` in the config limits which rewards the model learns from: `won_only`, and/or `min_ascension`. It applies to the training and validation data only, so models trained with different filters are scored on identical test sets. [`configs/train_winners.yaml`](configs/train_winners.yaml) trains on won runs only and compares the result with the default model:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.train --config configs/train_winners.yaml --compare-with models/card_pick
+```
+
+The report adds:
+
+- **Winning runs only:** a test set limited to won runs. It shows how well each method matches winners' picks.
+- **`win: followed` / `win: not`:** how often runs were won when the player's pick agreed or disagreed with the method's top choice. Treat this as a hint, not proof. Strong players win more *and* pick differently, so the gap mixes skill with pick quality.
+- **Comparison:** with `--compare-with`, how often the two models' top picks differ, and which cards each favours.
+
 ## Tests
 
 ```bash

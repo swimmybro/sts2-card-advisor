@@ -1,0 +1,35 @@
+# Card-pick model trained only on picks from winning runs.
+# python -m sts2_advisor.train --config configs/train_winners.yaml --compare-with models/card_pick
+
+data:
+  offers: data/processed/offers.parquet
+
+split:
+  test_frac: 0.2      # share of community runs held out for testing
+  valid_frac: 0.1     # share of training runs used for early stopping
+  seed: 0
+  hold_out_mine: true # evaluate on your own runs separately; never train on them
+
+# Which rewards to learn from (train/valid only; test sets are never filtered).
+train_filter:
+  won_only: true
+  min_ascension: null
+
+model:
+  objective: lambdarank
+  learning_rate: 0.05
+  num_leaves: 63
+  min_data_in_leaf: 100
+  feature_fraction: 0.9
+  num_boost_round: 1000
+  early_stopping_rounds: 50
+
+output:
+  model_dir: models/card_pick_winners
+
+mlflow:
+  enabled: true
+  db_path: mlruns/mlflow.db        # run metadata (SQLite)
+  artifact_dir: mlruns/artifacts   # saved models and metrics
+  experiment: card-pick
+  run_name: winners-only
