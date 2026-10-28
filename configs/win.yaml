@@ -20,6 +20,14 @@ model:
   num_boost_round: 3000
   early_stopping_rounds: 50
 
+# Reliability check (needs --pick-model). Win chances for options players rarely
+# take are pulled toward the reward's typical outcome: an option keeps
+# p / (p + shrink_k) of its difference, where p = how often players take it.
+reliability:
+  shrink_k: 0.05
+  low_confidence_below: 0.05  # flag options players take less often than this
+  tie_margin: 0.01            # options within this of the best count as tied
+
 output:
   model_dir: models/win_prob
 

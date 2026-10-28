@@ -129,6 +129,16 @@ PYTHONPATH=src .venv/bin/python -m sts2_advisor.win --config configs/win.yaml --
 
 It learns from outcomes, but it's still correlational. Stronger players both win more and pick differently, so a card can look good partly because good players take it.
 
+### Reliability check
+
+A win chance for an option players rarely take rests on few, unusual runs. With `--pick-model`, the win model adds a check, configured under `reliability` in `configs/win.yaml`:
+
+- **Pick chance:** how likely players are to take each option, from the pick model's scores within the reward. A scaling factor (`temperature`) is fitted on the validation runs so these match how often players actually took each option.
+- **Shrinkage:** each option's win chance is pulled toward the reward's typical outcome, meaning the average win chance weighted by how often players take each option. An option keeps `p / (p + shrink_k)` of its difference from that average, where `p` is its pick chance. With `shrink_k: 0.05`, an option taken 50% of the time keeps 91% of its difference, and one taken 2% of the time keeps 29%.
+- **Flags and ties:** options taken less than `low_confidence_below` (5%) of the time are flagged. Options within `tie_margin` (1 point) of the best are reported as tied.
+
+The settings are saved to `models/win_prob/reliability.json`, so the API applies exactly what was evaluated. The report shows the ranking metrics before and after the check.
+
 ## Card advisor API
 
 Serve the trained model over HTTP:
@@ -137,7 +147,10 @@ Serve the trained model over HTTP:
 .venv/bin/uvicorn --factory sts2_advisor.serve:create_app --app-dir src --port 8000
 ```
 
-`MODEL_DIR` (default `models/card_pick`) and `CARD_META` (default `configs/cards.csv`) choose the pick model and card list. `WIN_MODEL_DIR` (default `models/win_prob`) points to the optional win model. If it exists, each option also gets a `win_chance`, and the response gets a `win_suggestion`. Interactive docs are at http://127.0.0.1:8000/docs.
+`MODEL_DIR` (default `models/card_pick`) and `CARD_META` (default `configs/cards.csv`) choose the pick model and card list. `WIN_MODEL_DIR` (default `models/win_prob`) points to the optional win model. If it exists, each option also gets a `win_chance`, and the response gets a `win_suggestion`. If the win model was trained with `--pick-model`, the reliability check is applied:
+- each option also gets `pick_chance`, `raw_win_chance` (before the adjustment) and `low_confidence`
+- `win_chance` is the adjusted value
+- `win_tied` lists the options tied for best, and is empty when one option is clearly best Interactive docs are at http://127.0.0.1:8000/docs.
 
 - `GET /health`: confirms the server is up and shows which model is loaded.
 - `POST /rank`: send the current state and the offered cards; get them back ranked, plus `SKIP`:

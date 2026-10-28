@@ -1,10 +1,15 @@
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from sts2_advisor.features import OFFER_COLUMNS, SKIP
 from sts2_advisor.train import run as run_pick_model
-from sts2_advisor.win import auc, calibration, outcome_rows, run
+from sts2_advisor.win import (
+    adjust_win_chances, auc, calibration, fit_temperature, near_best, outcome_rows,
+    pick_probabilities, run,
+)
 from test_train import config as pick_config, rows
 
 
@@ -57,6 +62,41 @@ def test_outcome_rows_keep_picked_and_finished_only():
     assert out["offer_id"].tolist() == ["a:1"] and out["candidate"].tolist() == ["Y"]
 
 
+def test_pick_probabilities_per_reward():
+    ids = np.array([0, 0, 1, 1, 1])
+    p = pick_probabilities(ids, np.array([1.0, 1.0, 0.0, 0.0, np.log(2)]))
+    assert p.tolist() == pytest.approx([0.5, 0.5, 0.25, 0.25, 0.5])
+    sharp = pick_probabilities(ids, np.array([2.0, 0.0, 0, 0, 0]), temperature=0.1)
+    assert sharp[0] > 0.999
+
+
+def test_fit_temperature_recovers_known_scale():
+    rng = np.random.default_rng(0)
+    n_offers, k, true_t = 3000, 4, 2.0
+    scores = rng.normal(0, 3, size=(n_offers, k))
+    probs = np.exp(scores / true_t)
+    probs /= probs.sum(axis=1, keepdims=True)
+    picks = np.array([rng.choice(k, p=row) for row in probs])
+    df = pd.DataFrame({"offer_id": np.repeat(np.arange(n_offers), k),
+                       "picked": (np.tile(np.arange(k), n_offers) == np.repeat(picks, k))})
+    assert fit_temperature(df, scores.ravel()) == pytest.approx(true_t, rel=0.15)
+
+
+def test_adjust_win_chances_shrinks_rare_options():
+    ids = np.array([0, 0])
+    win, p = np.array([0.5, 0.9]), np.array([0.95, 0.05])
+    adjusted, baseline = adjust_win_chances(ids, win, p, shrink_k=0.05)
+    assert baseline.tolist() == pytest.approx([0.52, 0.52])  # 0.95*0.5 + 0.05*0.9
+    # common option keeps 95% of its gap; rare one only half
+    assert adjusted.tolist() == pytest.approx([0.52 - 0.95 * 0.02, 0.52 + 0.5 * 0.38])
+
+
+def test_near_best_marks_ties():
+    ids = np.array([0, 0, 0, 1, 1])
+    vals = np.array([0.40, 0.395, 0.30, 0.6, 0.5])
+    assert near_best(ids, vals, margin=0.01).tolist() == [True, True, False, True, False]
+
+
 def test_win_model_prefers_what_wins_over_what_is_popular(tmp_path):
     popular_vs_good_offers().to_parquet(tmp_path / "offers.parquet")
     run_pick_model(pick_config(tmp_path))  # pick model -> tmp_path/model
@@ -72,3 +112,17 @@ def test_win_model_prefers_what_wins_over_what_is_popular(tmp_path):
     assert r["agrees_with_pick_model"] < 0.9  # the two models disagree where it matters
     assert (tmp_path / "win" / "model.txt").exists()
     assert "mine" in metrics
+
+    # Reliability check: settings saved for the API, before/after metrics reported
+    rel = json.loads((tmp_path / "win" / "reliability.json").read_text())
+    assert rel["temperature"] > 0 and rel["shrink_k"] == 0.05
+    a = test["ranking_adjusted"]
+    assert a["median_spread"] <= r["median_spread"]
+    assert 0.0 <= a["tie_rate"] <= 1.0 and 0.0 <= a["raw_top_was_low_confidence"] <= 1.0
+
+
+def test_no_reliability_without_pick_model(tmp_path):
+    popular_vs_good_offers(n_runs=100).to_parquet(tmp_path / "offers.parquet")
+    metrics = run(win_config(tmp_path))
+    assert "ranking_adjusted" not in metrics["test"]
+    assert not (tmp_path / "win" / "reliability.json").exists()

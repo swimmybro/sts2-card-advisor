@@ -30,6 +30,7 @@ from sts2_advisor.features import (
 )
 from sts2_advisor.parse import OFFICIAL_CHARACTERS
 from sts2_advisor.train import load_model, predict
+from sts2_advisor.win import adjust_win_chances, near_best, pick_probabilities
 
 DEFAULT_MODEL_DIR = Path("models/card_pick")
 DEFAULT_WIN_MODEL_DIR = Path("models/win_prob")
@@ -87,16 +88,28 @@ class RankedCard(BaseModel):
     card: str
     upgraded: bool
     is_skip: bool
-    score: float = Field(description="Pick-model score: how likely players are to take it")
+    score: float = Field(description="Pick-model score: higher = players more likely to take it")
+    pick_chance: Optional[float] = Field(
+        None, description="Estimated share of players who would take this option")
     win_chance: Optional[float] = Field(
-        None, description="Win model: predicted chance of winning the run if you take it")
+        None, description="Predicted chance of winning the run if you take it, adjusted "
+                          "toward the reward's typical outcome when few players take it")
+    raw_win_chance: Optional[float] = Field(
+        None, description="The win model's estimate before that adjustment")
+    low_confidence: Optional[bool] = Field(
+        None, description="True when few players take this option, so its win chance "
+                          "rests on little evidence")
     known: bool = Field(description="False if the model never saw this card in training")
 
 
 class RankResponse(BaseModel):
     suggestion: str = Field(description="Top option by the pick model")
     win_suggestion: Optional[str] = Field(
-        None, description="Top option by predicted win chance (if a win model is loaded)")
+        None, description="Top option by win chance (if a win model is loaded)")
+    win_tied: List[str] = Field(
+        default_factory=list,
+        description="Options whose win chance is within the tie margin of the best; "
+                    "empty unless two or more are effectively tied")
     ranking: List[RankedCard]
     unknown_cards: List[str]
 
@@ -110,9 +123,12 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
     booster, categories = load_model(model_dir)
     win_dir = Path(win_model_dir or os.environ.get("WIN_MODEL_DIR", DEFAULT_WIN_MODEL_DIR))
     win = load_model(win_dir) if (win_dir / "model.txt").exists() else None
+    rel_path = win_dir / "reliability.json"
+    reliability = json.loads(rel_path.read_text()) if win and rel_path.exists() else None
     known_cards = set(categories["candidate"])
     metrics_path = model_dir / "metrics.json"
-    model_info = {"model_dir": str(model_dir), "win_model_dir": str(win_dir) if win else None}
+    model_info = {"model_dir": str(model_dir), "win_model_dir": str(win_dir) if win else None,
+                  "reliability": reliability}
     if metrics_path.exists():
         m = json.loads(metrics_path.read_text())
         model_info.update(best_iteration=m.get("best_iteration"),
@@ -139,18 +155,36 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
                 **relic_fields(normalize_id(r, "relic") for r in req.relics)}
         rows = pd.DataFrame(reward_rows(base, candidates, deck, meta))
         rows["score"] = predict(booster, categories, rows)
-        rows["win_chance"] = predict(*win, rows) if win else np.nan
+        rows["raw_win"] = predict(*win, rows) if win else np.nan
+        rows["win"], rows["pick_chance"], tied = rows["raw_win"], np.nan, []
+        if reliability:
+            one_reward = np.zeros(len(rows))
+            rows["pick_chance"] = pick_probabilities(one_reward, rows["score"],
+                                                     reliability["temperature"])
+            rows["win"], _ = adjust_win_chances(one_reward, rows["raw_win"],
+                                                rows["pick_chance"], reliability["shrink_k"])
+            close = near_best(one_reward, rows["win"], reliability["tie_margin"])
+            if close.sum() > 1:
+                tied = rows.loc[close].sort_values("win", ascending=False)["candidate"].tolist()
         rows = rows.sort_values("score", ascending=False)
+
+        def num(v):
+            return None if np.isnan(v) else round(float(v), 4)
+
         ranking = [
             RankedCard(card=r.candidate, upgraded=bool(r.cand_upgraded) if not r.is_skip else False,
                        is_skip=bool(r.is_skip), score=round(float(r.score), 4),
-                       win_chance=None if np.isnan(r.win_chance) else round(float(r.win_chance), 4),
+                       pick_chance=num(r.pick_chance), win_chance=num(r.win),
+                       raw_win_chance=num(r.raw_win) if reliability else None,
+                       low_confidence=(bool(r.pick_chance < reliability["low_confidence_below"])
+                                       if reliability else None),
                        known=bool(r.is_skip) or r.candidate in known_cards)
             for r in rows.itertuples()
         ]
         return RankResponse(
             suggestion=ranking[0].card,
-            win_suggestion=(rows.loc[rows["win_chance"].idxmax(), "candidate"] if win else None),
+            win_suggestion=(rows.loc[rows["win"].idxmax(), "candidate"] if win else None),
+            win_tied=tied,
             ranking=ranking,
             unknown_cards=sorted({c["id"] for c in candidates} - known_cards),
         )

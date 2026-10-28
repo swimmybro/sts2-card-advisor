@@ -17,6 +17,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,6 +38,58 @@ log = logging.getLogger(__name__)
 def outcome_rows(df: pd.DataFrame) -> pd.DataFrame:
     """The option each player actually picked, for runs that were finished."""
     return df[df["picked"].to_numpy() & df["run_won"].notna().to_numpy()]
+
+
+# ------------------------------------------------------------------ reliability
+#
+# A win chance for an option players rarely take rests on few, unusual runs.
+# The pick model says how often players take each option; options with little
+# support are pulled toward the reward's typical outcome and flagged.
+
+DEFAULT_RELIABILITY = {"shrink_k": 0.05, "low_confidence_below": 0.05, "tie_margin": 0.01}
+
+
+def pick_probabilities(offer_ids: np.ndarray, pick_scores: np.ndarray,
+                       temperature: float = 1.0) -> np.ndarray:
+    """Softmax of pick-model scores within each reward: P(players take this option)."""
+    s = pd.Series(np.asarray(pick_scores, dtype=float) / temperature)
+    g = s.groupby(np.asarray(offer_ids), sort=False)
+    e = np.exp(s - g.transform("max"))
+    return (e / e.groupby(np.asarray(offer_ids), sort=False).transform("sum")).to_numpy()
+
+
+def fit_temperature(df: pd.DataFrame, pick_scores: np.ndarray) -> float:
+    """Scale for pick scores that best matches how often players took each option."""
+    picked = df["picked"].to_numpy()
+    best_t, best_nll = 1.0, np.inf
+    for t in np.geomspace(0.1, 10, 61):
+        p = pick_probabilities(df["offer_id"].to_numpy(), pick_scores, t)[picked]
+        nll = -np.mean(np.log(np.clip(p, 1e-12, None)))
+        if nll < best_nll:
+            best_t, best_nll = float(t), nll
+    return best_t
+
+
+def adjust_win_chances(offer_ids: np.ndarray, win: np.ndarray, p_pick: np.ndarray,
+                       shrink_k: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Shrink each option's win chance toward the reward's typical outcome.
+
+    ``baseline`` is the expected win chance if the option is chosen the way
+    players usually choose (``sum(p_pick * win)``). An option keeps a share
+    ``p / (p + shrink_k)`` of its difference from the baseline, so options
+    players often take keep their estimate and rare ones mostly don't.
+    """
+    ids = np.asarray(offer_ids)
+    win, p_pick = np.asarray(win, dtype=float), np.asarray(p_pick, dtype=float)
+    baseline = pd.Series(win * p_pick).groupby(ids, sort=False).transform("sum").to_numpy()
+    weight = p_pick / (p_pick + shrink_k)
+    return baseline + weight * (win - baseline), baseline
+
+
+def near_best(offer_ids: np.ndarray, values: np.ndarray, margin: float) -> np.ndarray:
+    """True for options within ``margin`` of their reward's best value."""
+    v = pd.Series(np.asarray(values, dtype=float))
+    return (v >= v.groupby(np.asarray(offer_ids), sort=False).transform("max") - margin).to_numpy()
 
 
 # ------------------------------------------------------------------------ model
@@ -132,6 +185,24 @@ def ranking_metrics(df: pd.DataFrame, win_scores: np.ndarray,
     return out
 
 
+def reliability_metrics(df: pd.DataFrame, win_scores: np.ndarray, pick_scores: np.ndarray,
+                        rel: Dict[str, Any]) -> Dict[str, Any]:
+    """Ranking metrics after shrinkage, plus how often ties / thin support occur."""
+    ids = df["offer_id"].to_numpy()
+    p_pick = pick_probabilities(ids, pick_scores, rel["temperature"])
+    adjusted, _ = adjust_win_chances(ids, win_scores, p_pick, rel["shrink_k"])
+    out = ranking_metrics(df, adjusted, pick_scores)
+    tied = pd.Series(near_best(ids, adjusted, rel["tie_margin"])).groupby(ids, sort=False).sum()
+    raw_top_idx = pd.Series(win_scores).groupby(ids, sort=False).idxmax().to_numpy()
+    out.update(
+        tie_rate=float((tied > 1).mean()),
+        low_confidence_options=float((p_pick < rel["low_confidence_below"]).mean()),
+        raw_top_was_low_confidence=float(
+            (p_pick[raw_top_idx] < rel["low_confidence_below"]).mean()),
+    )
+    return out
+
+
 # ------------------------------------------------------------------------- main
 
 def run(cfg: Dict[str, Any], pick_model: Optional[Path] = None) -> Dict[str, Any]:
@@ -142,6 +213,13 @@ def run(cfg: Dict[str, Any], pick_model: Optional[Path] = None) -> Dict[str, Any
         "n_outcomes": {k: int(len(outcome_rows(v))) for k, v in parts.items()},
     }
     pick = load_model(pick_model) if pick_model else None
+    reliability = None
+    if pick:
+        valid = parts["valid"]
+        reliability = dict(DEFAULT_RELIABILITY, **(cfg.get("reliability") or {}),
+                           temperature=fit_temperature(valid, predict(*pick, valid)),
+                           pick_model_dir=str(pick_model))
+        metrics["reliability"] = reliability
     for split in ("test", "mine"):
         d = parts[split]
         if d.empty:
@@ -150,6 +228,9 @@ def run(cfg: Dict[str, Any], pick_model: Optional[Path] = None) -> Dict[str, Any
         pick_scores = predict(*pick, d) if pick else None
         metrics[split] = {"outcome": outcome_metrics(d, booster, categories),
                           "ranking": ranking_metrics(d, win_scores, pick_scores)}
+        if reliability:
+            metrics[split]["ranking_adjusted"] = reliability_metrics(
+                d, win_scores, pick_scores, reliability)
     gain = booster.feature_importance("gain")
     metrics["feature_importance"] = dict(sorted(
         zip(booster.feature_name(), (gain / gain.sum()).round(4).tolist()),
@@ -157,10 +238,12 @@ def run(cfg: Dict[str, Any], pick_model: Optional[Path] = None) -> Dict[str, Any
 
     model_dir = Path(cfg["output"]["model_dir"])
     save_model(booster, categories, metrics, model_dir)
+    if reliability:
+        (model_dir / "reliability.json").write_text(json.dumps(reliability, indent=2))
     if cfg.get("mlflow", {}).get("enabled"):
         flat = {"best_iteration": metrics["best_iteration"]}
         for split in ("test", "mine"):
-            for group in ("outcome", "ranking"):
+            for group in ("outcome", "ranking", "ranking_adjusted"):
                 for k, v in metrics.get(split, {}).get(group, {}).items():
                     if isinstance(v, (int, float)):
                         flat[f"{split}.{group}.{k}"] = v
@@ -196,6 +279,29 @@ def report(metrics: Dict[str, Any]) -> str:
                           f"{k} (+{v:.1%})" for k, v in r["favoured_over_players"].items()),
                       "  Picked as top option less often than players pick it: " + ", ".join(
                           f"{k} ({v:.1%})" for k, v in r["less_than_players"].items())]
+        a = metrics[split].get("ranking_adjusted")
+        if a:
+            rel = metrics["reliability"]
+            lines += [
+                f"  With the reliability check (shrink_k {rel['shrink_k']}, "
+                f"pick-score temperature {rel['temperature']:.2f}):",
+                f"    Unadjusted top option was rarely taken (<{rel['low_confidence_below']:.0%}) "
+                f"in {a['raw_top_was_low_confidence']:.1%} of rewards; "
+                f"{a['low_confidence_options']:.1%} of all options are low-confidence",
+                f"    Median gap between best and worst option: {r['median_spread']:.1%} -> "
+                f"{a['median_spread']:.1%}",
+                f"    Rewards with a tie for best (within {rel['tie_margin']:.0%}): {a['tie_rate']:.1%}",
+                f"    Top option agrees with the player: {r['agrees_with_player']:.1%} -> "
+                f"{a['agrees_with_player']:.1%}; with the pick model: "
+                f"{r.get('agrees_with_pick_model', float('nan')):.1%} -> "
+                f"{a['agrees_with_pick_model']:.1%}",
+                f"    Suggests SKIP: {r['suggests_skip']:.1%} -> {a['suggests_skip']:.1%}",
+            ]
+            if split == "test":
+                lines += ["    Favoured over players: " + ", ".join(
+                              f"{k} (+{v:.1%})" for k, v in a["favoured_over_players"].items()),
+                          "    Less than players: " + ", ".join(
+                              f"{k} ({v:.1%})" for k, v in a["less_than_players"].items())]
     lines += ["", "Top features (share of gain):"]
     for name, share in list(metrics["feature_importance"].items())[:10]:
         lines.append(f"  {name:<22} {share:6.1%}")

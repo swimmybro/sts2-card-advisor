@@ -15,7 +15,7 @@ def trained(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("api")
     synthetic_offers().to_parquet(tmp / "offers.parquet")
     run(config(tmp))
-    run_win(win_config(tmp))
+    run_win(win_config(tmp), pick_model=tmp / "model")  # also writes reliability.json
     meta = tmp / "cards.csv"  # costs must match synthetic_offers' cand_cost
     meta.write_text("id,type,rarity,color,cost,is_x_cost\n" + "".join(
         f"{c},Attack,Common,ironclad,{cost},False\n"
@@ -63,6 +63,20 @@ def test_win_chance_per_option(win_client):
     assert all(0.0 <= c <= 1.0 for c in chances.values())
     assert body["win_suggestion"] == max(chances, key=chances.get)
     assert body["suggestion"] == "GOOD"  # pick-model suggestion unchanged
+
+
+def test_reliability_fields(win_client):
+    body = win_client.post("/rank", json=state()).json()
+    ranking = {r["card"]: r for r in body["ranking"]}
+    assert sum(r["pick_chance"] for r in ranking.values()) == pytest.approx(1.0, abs=1e-3)
+    for r in ranking.values():
+        assert 0.0 <= r["raw_win_chance"] <= 1.0
+        assert r["low_confidence"] == (r["pick_chance"] < 0.05)
+    # GOOD is always taken in training, so it is never low-confidence
+    assert ranking["GOOD"]["low_confidence"] is False
+    assert isinstance(body["win_tied"], list)
+    if body["win_tied"]:
+        assert body["win_suggestion"] == body["win_tied"][0] and len(body["win_tied"]) > 1
 
 
 def test_rank_suggests_learned_pick(client):
