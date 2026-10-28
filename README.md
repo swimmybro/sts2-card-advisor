@@ -181,6 +181,36 @@ Following its skip suggestions showed +5.8 points, and its card suggestions +4.5
 - **Observed gains run larger than predicted margins.** That's consistent with some skill effect, so read the margins as how clear a call is, not as exact promises.
 - **Your own runs weren't checked:** about 3,500 rewards is too few for this matching.
 
+## What should I pick? (during a run)
+
+At a card reward, type the offered cards (a trailing `+` means upgraded):
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.suggest "Fear" "Drain Power" "Defy+"
+```
+
+Everything else comes from the game's save of your run in progress (`current_run.save`, next to the run history): character, ascension, act, floor, HP, gold, every card in your deck with its upgrades, and your relics. Add `--elite` or `--boss` for those rewards.
+
+```
+Necrobinder A5, act 2 floor 30 (monster), HP 51/73, 417 gold, 25-card deck, 10 relics
+
+  Take: DEFY+  (clear call: +3.7 pts of win chance over the next option)
+
+  option               win chance  players take
+  DEFY+                     51.8%           71%
+  FEAR                      48.1%            3%  rarely taken here: less reliable
+  SKIP                      47.6%           24%
+  DRAIN_POWER               45.5%            3%  rarely taken here: less reliable
+```
+
+- **The suggestion** follows the same rule as the API. It's a **clear call** at 2+ points over the next option, a **slight edge** below that, or a **close call** when options are tied, in which case it's what players take most. See [How much to trust the advice](#how-much-to-trust-the-advice).
+- **Unknown cards** are listed but never suggested. Card names the models don't know (often typos) are flagged.
+- **Stale saves:** if the save is more than 3 hours old, it asks whether that's really the run you're playing.
+- **Floor:** read from the save. It may be one off, depending on exactly when the game saved, which barely matters; `--floor` overrides it.
+- **Finding the save:** next to the history folder that `watch.py` finds, or set `--save` / `$STS2_SAVE`.
+- **Co-op saves** need `--player N`.
+- If a reward screen is open in the save, its cards are used when you don't type any. The save's format for that isn't documented, so this is best-effort.
+
 ## Card advisor API
 
 Serve the trained model over HTTP:

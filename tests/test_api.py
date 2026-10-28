@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from sts2_advisor import serve
+from sts2_advisor import advise
 from sts2_advisor.serve import create_app, normalize_card, normalize_id
 from sts2_advisor.train import run
 from sts2_advisor.win import run as run_win
@@ -113,13 +113,13 @@ def test_unknown_cards_flagged(client):
 
 def test_upgraded_deck_cards_count_toward_upgrade_density(client, monkeypatch):
     seen = {}
-    real = serve.reward_rows
+    real = advise.reward_rows
 
     def spy(base, *a, **kw):
         seen.update(base)
         return real(base, *a, **kw)
 
-    monkeypatch.setattr(serve, "reward_rows", spy)
+    monkeypatch.setattr(advise, "reward_rows", spy)
     client.post("/rank", json=state(deck=["Strike+", "Defend+", "Bash"]))
     assert seen["deck_upgraded"] == 2
 

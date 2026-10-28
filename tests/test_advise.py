@@ -33,6 +33,13 @@ def test_without_win_model_uses_the_pick_model():
     assert set(out["suggestion_source"]) == {"pick_model"}
 
 
+def test_unknown_cards_are_never_suggested():
+    # C has the best win chance but the models have never seen it (likely a typo)
+    rows = options(win=[0.30, 0.35, 0.90], score=[1.0, 0.0, 2.0], tied=[False] * 3)
+    rows["known"] = [True, True, False]
+    assert suggested(rows) == (["B"], "win_model")
+
+
 def test_one_suggestion_per_reward():
     two = pd.concat([options([0.3, 0.4], [1, 0], [False, False]),
                      options([0.5, 0.5], [0, 1], [True, True]).assign(offer_id=1)],

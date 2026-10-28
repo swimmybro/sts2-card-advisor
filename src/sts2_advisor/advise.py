@@ -1,20 +1,22 @@
 """Score the options at card rewards with the pick and win models.
 
-Shared by the API (one live reward) and the run reviewer (every reward in a
-finished run), so both produce identical numbers.
+Shared by the API and the ``suggest`` command (one live reward) and the run
+reviewer (every reward in a finished run), so all produce identical numbers.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from sts2_advisor.features import DEFAULT_CARD_META, load_card_meta
+from sts2_advisor.features import DEFAULT_CARD_META, load_card_meta, relic_fields, reward_rows
 from sts2_advisor.train import add_pick_features, load_model, predict
 from sts2_advisor.win import adjust_win_chances, near_best, pick_probabilities
 
@@ -91,7 +93,37 @@ class Advisor:
             rows["low_confidence"] = rows["pick_chance"] < rel["low_confidence_below"]
             close = pd.Series(near_best(ids, rows["win"], rel["tie_margin"]), index=rows.index)
             rows["tied"] = close & (close.groupby(ids).transform("sum") > 1)
+        rows["known"] = rows["is_skip"].astype(bool) | rows["candidate"].isin(self.known_cards)
         return _suggest(rows, has_win=self.win is not None)
+
+
+    def rank_reward(self, state: Dict[str, Any], deck: List[Tuple[str, bool]],
+                    relics: List[str], offered: List[Tuple[str, bool]]) -> pd.DataFrame:
+        """Score one live card reward.
+
+        ``state``: character, ascension, act, floor, room_type, hp, max_hp,
+        gold. ``deck`` and ``offered`` are ``(card id, upgraded)`` pairs,
+        ``relics`` relic ids (all normalized, see :func:`normalize_card`).
+        Returns the scored options, the suggestion first and then by win chance.
+        """
+        base = dict(state, deck_upgraded=sum(up for _, up in deck), **relic_fields(relics))
+        candidates = [{"id": cid, "upgraded": up} for cid, up in offered]
+        rows = pd.DataFrame(reward_rows(base, candidates, Counter(cid for cid, _ in deck),
+                                        self.meta)).assign(offer_id=0)
+        rows = self.score(rows)
+        return rows.sort_values(["suggested", "win" if self.win else "score"], ascending=False)
+
+
+def normalize_id(name: str, prefix: str) -> str:
+    """'Burning Blood' / 'RELIC.BURNING_BLOOD' -> 'BURNING_BLOOD' (prefix='relic')."""
+    name = re.sub(rf"^{prefix}\.", "", name.strip(), flags=re.IGNORECASE)
+    return re.sub(r"[\s']+", "_", name).upper()
+
+
+def normalize_card(name: str) -> Tuple[str, bool]:
+    """'Shrug It Off+' / 'CARD.SHRUG_IT_OFF' -> ('SHRUG_IT_OFF', upgraded?)."""
+    name = name.strip()
+    return normalize_id(name.rstrip("+").strip(), "card"), name.endswith("+")
 
 
 def _suggest(rows: pd.DataFrame, has_win: bool) -> pd.DataFrame:
@@ -105,5 +137,7 @@ def _suggest(rows: pd.DataFrame, has_win: bool) -> pd.DataFrame:
         source = np.where(tie, "win_tie_popular", "win_model")
     else:
         key, source = rows["score"].to_numpy(), np.full(len(rows), "pick_model")
+    if "known" in rows:  # never suggest a card the models haven't seen (often a typo)
+        key = np.where(rows["known"].to_numpy(dtype=bool), key, -np.inf)
     best = pd.Series(key, index=rows.index).groupby(ids).idxmax()
     return rows.assign(suggested=rows.index.isin(best.to_numpy()), suggestion_source=source)

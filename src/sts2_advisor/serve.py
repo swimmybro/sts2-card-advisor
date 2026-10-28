@@ -14,30 +14,15 @@ Then open http://127.0.0.1:8000/docs for interactive docs.
 from __future__ import annotations
 
 import re
-from collections import Counter
 from pathlib import Path
-from typing import List, Literal, Optional, Tuple, Union
+from typing import List, Literal, Optional, Union
 
 import numpy as np
-import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from sts2_advisor.advise import Advisor
-from sts2_advisor.features import relic_fields, reward_rows
+from sts2_advisor.advise import Advisor, normalize_card, normalize_id
 from sts2_advisor.parse import OFFICIAL_CHARACTERS
-
-
-def normalize_id(name: str, prefix: str) -> str:
-    """'Burning Blood' / 'RELIC.BURNING_BLOOD' -> 'BURNING_BLOOD' (prefix='relic')."""
-    name = re.sub(rf"^{prefix}\.", "", name.strip(), flags=re.IGNORECASE)
-    return re.sub(r"[\s']+", "_", name).upper()
-
-
-def normalize_card(name: str) -> Tuple[str, bool]:
-    """'Shrug It Off+' / 'CARD.SHRUG_IT_OFF' -> ('SHRUG_IT_OFF', upgraded?)."""
-    name = name.strip()
-    return normalize_id(name.rstrip("+").strip(), "card"), name.endswith("+")
 
 
 class OfferedCard(BaseModel):
@@ -128,24 +113,19 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
 
     @app.post("/rank", response_model=RankResponse)
     def rank(req: RankRequest) -> RankResponse:
-        deck_cards = [normalize_card(c) for c in req.deck]
-        deck = Counter(cid for cid, _ in deck_cards)
-        candidates = []
+        offered = []
         for c in req.offered:
             cid, up = normalize_card(c) if isinstance(c, str) else normalize_card(c.id)
-            candidates.append({"id": cid, "upgraded": up or getattr(c, "upgraded", False)})
-        base = {"character": req.character, "ascension": req.ascension, "act": req.act,
-                "floor": req.floor, "room_type": req.room_type, "hp": req.hp,
-                "max_hp": req.max_hp, "gold": req.gold,
-                "deck_upgraded": sum(up for _, up in deck_cards),
-                **relic_fields(normalize_id(r, "relic") for r in req.relics)}
-        rows = pd.DataFrame(reward_rows(base, candidates, deck, advisor.meta)).assign(offer_id=0)
-        rows = advisor.score(rows)
+            offered.append((cid, up or getattr(c, "upgraded", False)))
+        state = {"character": req.character, "ascension": req.ascension, "act": req.act,
+                 "floor": req.floor, "room_type": req.room_type, "hp": req.hp,
+                 "max_hp": req.max_hp, "gold": req.gold}
+        rows = advisor.rank_reward(state, [normalize_card(c) for c in req.deck],
+                                   [normalize_id(r, "relic") for r in req.relics], offered)
+        candidates = [{"id": cid} for cid, _ in offered]
         tied = rows[rows["tied"]].sort_values("win", ascending=False)["candidate"].tolist()
         popular = rows.loc[rows["score"].idxmax(), "candidate"]
         source = rows["suggestion_source"].iloc[0]
-        rows = rows.sort_values(["suggested", "win" if advisor.win else "score"],
-                                ascending=False)
 
         def num(v):
             return None if np.isnan(v) else round(float(v), 4)
