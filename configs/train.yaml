@@ -20,7 +20,7 @@ model:
   num_leaves: 63
   min_data_in_leaf: 100
   feature_fraction: 0.9
-  num_boost_round: 1000
+  num_boost_round: 3000
   early_stopping_rounds: 50
 
 output:
