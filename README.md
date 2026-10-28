@@ -100,6 +100,33 @@ The report adds:
 - **`win: followed` / `win: not`:** how often runs were won when the player's pick agreed or disagreed with the method's top choice. Treat this as a hint, not proof. Strong players win more *and* pick differently, so the gap mixes skill with pick quality.
 - **Comparison:** with `--compare-with`, how often the two models' top picks differ, and which cards each favours.
 
+## Card advisor API
+
+Serve the trained model over HTTP:
+
+```bash
+.venv/bin/uvicorn --factory sts2_advisor.serve:create_app --app-dir src --port 8000
+```
+
+`MODEL_DIR` (default `models/card_pick`) and `CARD_META` (default `configs/cards.csv`) choose the model and card list. Interactive docs are at http://127.0.0.1:8000/docs.
+
+- `GET /health`: confirms the server is up and shows which model is loaded.
+- `POST /rank`: send the current state and the offered cards; get them back ranked, plus `SKIP`:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/rank -H 'Content-Type: application/json' -d '{
+  "character": "Ironclad", "ascension": 8, "act": 1, "floor": 6, "room_type": "monster",
+  "hp": 58, "max_hp": 80, "gold": 140,
+  "deck": ["Strike Ironclad", "Strike Ironclad", "Defend Ironclad", "Bash+", "Pommel Strike"],
+  "relics": ["Burning Blood"],
+  "offered": ["Shrug It Off", "Anger", "Headbutt"]
+}'
+```
+
+Card names are forgiving: `"Shrug It Off"`, `"shrug_it_off"` and `"CARD.SHRUG_IT_OFF"` all work, and a trailing `+` marks an upgraded card. `deck` is the deck *before* the pick, and `relics` is every relic you hold. Features are computed with the same code as the training data (`features.reward_rows`).
+
+The response's `suggestion` is the top-ranked option. `ranking` lists every option with its model score; higher is better, and scores are only meaningful relative to each other. Cards the model never saw in training, often typos, get `known: false` and are listed in `unknown_cards`. Treat their scores with suspicion.
+
 ## Tests
 
 ```bash

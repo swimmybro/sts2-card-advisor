@@ -132,6 +132,38 @@ def _deck_features(deck: Counter, meta: Dict[str, dict]) -> Dict[str, int]:
     }
 
 
+def reward_rows(base: Dict[str, Any], candidates: List[Dict[str, Any]],
+                deck: Counter, meta: Dict[str, dict]) -> List[dict]:
+    """Rows for one card reward: each candidate plus a ``SKIP`` row.
+
+    ``base`` holds the run state (character, ascension, act, floor,
+    room_type, hp, max_hp, gold, n_relics, plus any id/label fields).
+    ``candidates`` are ``{"id", "upgraded", "picked"}`` dicts; ``picked``
+    may be omitted when scoring a live reward. ``deck`` is the deck
+    *before* the pick. Shared by the feature builder and the API so both
+    compute features the same way.
+    """
+    hp, max_hp = base.get("hp"), base.get("max_hp")
+    base = dict(base, n_offered=len(candidates),
+                hp_frac=hp / max_hp if hp is not None and max_hp else None,
+                **_deck_features(deck, meta))
+    rows = []
+    for c in candidates:
+        m = meta.get(c["id"], {})
+        rows.append(dict(
+            base, candidate=c["id"], is_skip=False,
+            cand_type=m.get("type"), cand_rarity=m.get("rarity"), cand_cost=m.get("cost"),
+            cand_upgraded=bool(c.get("upgraded")), cand_copies_in_deck=deck[c["id"]],
+            picked=bool(c.get("picked")),
+        ))
+    rows.append(dict(
+        base, candidate=SKIP, is_skip=True, cand_type=None, cand_rarity=None,
+        cand_cost=None, cand_upgraded=None, cand_copies_in_deck=None,
+        picked=not any(c.get("picked") for c in candidates),
+    ))
+    return rows
+
+
 def _group(data: Dict[str, Any], run_id: str) -> str:
     """Train/test grouping key: the player when known, otherwise the run.
 
@@ -185,29 +217,16 @@ def offer_rows(data: Dict[str, Any], run_id: str, source: str,
                     run_ctx,
                     offer_id=f"{run_id}:{floor}", act=act_idx, floor=floor,
                     room_type=point["map_point_type"], hp=hp, max_hp=max_hp,
-                    hp_frac=hp / max_hp if hp is not None and max_hp else None,
                     gold=stats.get("current_gold"),
                     n_relics=bisect.bisect_left(relic_floors, floor),
-                    n_offered=len(offer),
-                    **_deck_features(deck, meta),
                 )
-                for c in offer:
-                    card_id = _strip(c["card"]["id"])
-                    m = meta.get(card_id, {})
-                    rows.append(dict(
-                        base, candidate=card_id, is_skip=False,
-                        cand_type=m.get("type"), cand_rarity=m.get("rarity"),
-                        cand_cost=m.get("cost"),
-                        cand_upgraded=c["card"].get("current_upgrade_level", 0) > 0,
-                        cand_copies_in_deck=deck[card_id],
-                        picked=bool(c.get("was_picked")),
-                    ))
-                rows.append(dict(
-                    base, candidate=SKIP, is_skip=True, cand_type=None,
-                    cand_rarity=None, cand_cost=None, cand_upgraded=None,
-                    cand_copies_in_deck=None,
-                    picked=not any(c.get("was_picked") for c in offer),
-                ))
+                candidates = [
+                    {"id": _strip(c["card"]["id"]),
+                     "upgraded": c["card"].get("current_upgrade_level", 0) > 0,
+                     "picked": bool(c.get("was_picked"))}
+                    for c in offer
+                ]
+                rows.extend(reward_rows(base, candidates, deck, meta))
             # Changes at this point happen at/after the reward, so apply them last.
             deck.update(_deck_changes(stats))
     return rows
