@@ -1,9 +1,9 @@
 # sts2-card-advisor
-MLOps project: predicts Slay the Spire 2 run outcomes and recommends card picks from my run history.
+MLOps project: recommends which Slay the Spire 2 card to take (or whether to skip), ranking the options by predicted chance of winning the run given your current deck. It learns from about 220,000 community runs.
 
 ## Setup
 
-Requires Python 3.9+.
+Requires Python 3.9+. On macOS, LightGBM also needs OpenMP: `brew install libomp`.
 
 ```bash
 python3 -m venv .venv
@@ -12,6 +12,80 @@ python3 -m venv .venv
 ```bash
 .venv/bin/pip install -r requirements.txt
 ```
+
+The trained models live in `models/` and aren't in git. Build them with [Retraining in one command](#retraining-in-one-command), or copy the `models/` folder from a machine that has them.
+
+## Everyday use
+
+Run these from the project folder.
+
+**1. At a card reward (during a run):** type the offered cards, with a trailing `+` for upgraded ones; add `--elite` or `--boss` after those fights. Everything else comes from the game's save of your run in progress.
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.suggest "Shrug It Off" Anger Headbutt+
+```
+
+- **Clear call** (2+ points ahead): take it.
+- **Slight edge:** the advisor leans one way; use your judgement.
+- **Close call:** the options are effectively equal on win chance, so it suggests what most players take, and your own read of the deck is as good as the advisor's.
+
+See [What should I pick?](#what-should-i-pick-during-a-run) and [How much to trust the advice](#how-much-to-trust-the-advice).
+
+**2. After a run:** keep the watcher running in a second terminal. It copies each finished run into `data/raw/` and prints a review of your picks. Or review the latest run on demand:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.watch
+```
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.watch --review latest
+```
+
+In reviews, focus on the clear calls where you disagreed.
+
+**3. After a game patch:** download the new community export into `data/external/`. Check whether the models still fit, and retrain if the monitor recommends it (about 15 minutes; new models replace the current ones only if they're at least as good):
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.monitor data/external/<new export>.jsonl.gz
+```
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.pipeline
+```
+
+**Shortcut:** add an alias to your shell's startup file so `pick Anger Inflame Headbutt` works from anywhere. For bash this is `~/.bash_profile`; for zsh, `~/.zshrc`. Run once:
+
+```bash
+echo 'alias pick="cd ~/Documents/Projects/sts2-card-advisor && PYTHONPATH=src .venv/bin/python -m sts2_advisor.suggest"' >> ~/.bash_profile && source ~/.bash_profile
+```
+
+Adjust the folder path if your copy lives elsewhere.
+
+### On a Windows PC
+
+The code is the same; the commands are written differently. In PowerShell, from the project folder:
+
+```powershell
+python -m venv .venv
+```
+
+```powershell
+.venv\Scripts\pip install -r requirements.txt
+```
+
+```powershell
+$env:PYTHONPATH = "src"; .venv\Scripts\python -m sts2_advisor.suggest "Shrug It Off" Anger Headbutt+
+```
+
+- **Models:** copy the `models\` folder (`card_pick`, `win_prob`) from your Mac. Retraining on the PC also works, but needs the data in `data\raw` and `data\external` and about 10 GB of free memory.
+- **No extra install:** LightGBM's Windows build includes OpenMP, so you don't need `libomp`.
+- **The game's save folder** is found automatically. The tools look in `%APPDATA%\SlayTheSpire2\steam\<steam-id>\profile*\saves\` (Windows), `~/Library/Application Support/SlayTheSpire2/…` (macOS) and `~/.local/share/SlayTheSpire2/…` (Linux). The macOS location is confirmed; the Windows one follows the same layout. If the tools say they can't find it, locate the folder holding `current_run.save` and the `history` folder, and point them at it:
+
+  ```powershell
+  $env:STS2_HISTORY_DIR = "C:\path\to\SlayTheSpire2\steam\<steam-id>\profile1\saves\history"
+  ```
+
+  To make that permanent, use `setx STS2_HISTORY_DIR "C:\path\…\history"` and open a new PowerShell window.
 
 ## Getting run data
 
@@ -278,7 +352,7 @@ PYTHONPATH=src .venv/bin/python -m sts2_advisor.watch
 - **Default:** checks every 30 seconds (`--interval`) until you stop it.
 - **`--once`:** copies new runs, reviews them, and exits.
 - **`--review latest`:** reviews a run already in `data/raw`. Instead of `latest`, you can pass a run ID or a file path.
-- **Finding the history folder:** on macOS it's found automatically under `~/Library/Application Support/SlayTheSpire2/steam/<steam-id>/profile*/saves/history`. If you have several profiles, the most recently used one is chosen. Set `STS2_HISTORY_DIR` or pass `--history` to choose it yourself.
+- **Finding the history folder:** it's found automatically under `SlayTheSpire2/steam/<steam-id>/profile*/saves/history`, in the game's data folder on macOS, Windows or Linux (see [On a Windows PC](#on-a-windows-pc)). If you have several profiles, the most recently used one is chosen. Set `STS2_HISTORY_DIR` or pass `--history` to choose it yourself.
 - **What gets copied:** only `.run` files not already in `data/raw`. Backups (`.run.backup`) are skipped, and so are files the game is still writing; they're picked up on the next check.
 
 For each solo run, the review lists every card reward with:

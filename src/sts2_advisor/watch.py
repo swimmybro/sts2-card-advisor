@@ -8,9 +8,10 @@ reward's pick with the pick model's and the win model's suggestions.
     python -m sts2_advisor.watch --once           # copy new runs, review them, exit
     python -m sts2_advisor.watch --review latest  # review a run already in data/raw
 
-The history folder is found automatically on macOS
-(``~/Library/Application Support/SlayTheSpire2/steam/<steam-id>/profile*/saves/history``),
-or set ``$STS2_HISTORY_DIR`` / ``--history``.
+The history folder (``SlayTheSpire2/steam/<steam-id>/profile*/saves/history``
+in the game's data folder) is found automatically on macOS, and in the
+expected places on Windows and Linux; otherwise set ``$STS2_HISTORY_DIR`` /
+``--history``.
 """
 
 from __future__ import annotations
@@ -33,23 +34,41 @@ from sts2_advisor.parse import RunParseError, _strip, load_run
 log = logging.getLogger(__name__)
 
 DEFAULT_RAW_DIR = Path("data/raw")
-HISTORY_GLOB = "Library/Application Support/SlayTheSpire2/steam/*/profile*/saves/history"
+HISTORY_GLOB = "steam/*/profile*/saves/history"
 
 
 # ------------------------------------------------------------------------ sync
 
+def game_data_dirs() -> List[Path]:
+    """Where the game keeps its data on macOS, Windows and Linux.
+
+    The macOS location is confirmed; the others follow the same layout
+    (``SlayTheSpire2`` in the platform's per-user app-data folder).
+    """
+    home = Path.home()
+    dirs = [home / "Library" / "Application Support" / "SlayTheSpire2"]  # macOS
+    if os.environ.get("APPDATA"):  # Windows: C:\Users\<you>\AppData\Roaming
+        dirs.append(Path(os.environ["APPDATA"]) / "SlayTheSpire2")
+    dirs.append(home / "AppData" / "Roaming" / "SlayTheSpire2")
+    xdg = os.environ.get("XDG_DATA_HOME") or str(home / ".local" / "share")  # Linux
+    dirs.append(Path(xdg) / "SlayTheSpire2")
+    return list(dict.fromkeys(dirs))  # drop duplicates, keep order
+
+
 def find_history_dir(explicit: Optional[Path] = None) -> Path:
     """``--history``, else ``$STS2_HISTORY_DIR``, else the most recently used
-    profile under the default macOS location."""
+    profile in the game's data folder (see :func:`game_data_dirs`)."""
     if explicit:
         return Path(explicit)
     if os.environ.get("STS2_HISTORY_DIR"):
         return Path(os.environ["STS2_HISTORY_DIR"])
-    found = sorted(Path.home().glob(HISTORY_GLOB), key=lambda p: p.stat().st_mtime)
+    found = sorted((p for d in game_data_dirs() for p in d.glob(HISTORY_GLOB)),
+                   key=lambda p: p.stat().st_mtime)
     if not found:
+        searched = "\n  ".join(str(d / HISTORY_GLOB) for d in game_data_dirs())
         raise FileNotFoundError(
-            f"No run history found under ~/{HISTORY_GLOB}; pass --history or set "
-            "STS2_HISTORY_DIR.")
+            f"No run history found. Looked in:\n  {searched}\n"
+            "Pass --history or set STS2_HISTORY_DIR to your 'saves/history' folder.")
     if len(found) > 1:
         log.info("several profiles found; using the most recent: %s", found[-1])
     return found[-1]

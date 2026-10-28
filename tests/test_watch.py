@@ -46,9 +46,40 @@ def test_sync_leaves_existing_files_alone(tmp_path):
     assert (raw / "100.run").read_text() == "mine"
 
 
-def test_find_history_dir(tmp_path, monkeypatch):
-    monkeypatch.delenv("STS2_HISTORY_DIR", raising=False)
+@pytest.fixture
+def no_game_env(tmp_path, monkeypatch):
+    """A fake home folder, with none of the environment variables that point elsewhere."""
+    for var in ("STS2_HISTORY_DIR", "APPDATA", "XDG_DATA_HOME"):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    return tmp_path
+
+
+def history_under(base):
+    found = base / "SlayTheSpire2" / "steam" / "123" / "profile1" / "saves" / "history"
+    found.mkdir(parents=True)
+    return found
+
+
+def test_find_history_dir_on_windows(no_game_env, monkeypatch):
+    appdata = no_game_env / "AppData" / "Roaming"
+    monkeypatch.setenv("APPDATA", str(appdata))
+    expected = history_under(appdata)
+    assert find_history_dir() == expected
+
+
+def test_find_history_dir_on_linux(no_game_env):
+    expected = history_under(no_game_env / ".local" / "share")
+    assert find_history_dir() == expected
+
+
+def test_find_history_dir_error_lists_places(no_game_env):
+    with pytest.raises(FileNotFoundError, match="(?s)Looked in:.*STS2_HISTORY_DIR") as e:
+        find_history_dir()
+    assert "Application Support" in str(e.value) and ".local" in str(e.value)
+
+
+def test_find_history_dir(tmp_path, monkeypatch, no_game_env):
     with pytest.raises(FileNotFoundError):
         find_history_dir()
     found = (tmp_path / "Library/Application Support/SlayTheSpire2/steam/123"
