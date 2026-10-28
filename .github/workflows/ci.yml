@@ -27,10 +27,58 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: requirements*.txt
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run tests
         run: python -m pytest -v
+
+  docker:
+    # Build the API image and check it serves rankings, using tiny models
+    # trained on synthetic data (real models aren't in git).
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Train demo models
+        run: |
+          pip install -r requirements.txt
+          PYTHONPATH=src:tests python tests/make_demo_models.py demo_models
+
+      - name: Build image
+        run: docker build -t sts2-card-advisor:ci .
+
+      - name: Smoke test
+        run: |
+          docker run -d --name advisor -p 8000:8000 \
+            -v "$PWD/demo_models:/app/models:ro" sts2-card-advisor:ci
+          for i in $(seq 1 30); do curl -sf localhost:8000/health > /dev/null && break; sleep 2; done
+          curl -sf localhost:8000/health | python -c "
+          import json, sys
+          b = json.load(sys.stdin)
+          assert b['status'] == 'ok' and b['win_model_dir'] and b['reliability'], b
+          print('health ok')"
+          curl -sf -X POST localhost:8000/rank -H 'Content-Type: application/json' -d '{
+            "character": "Ironclad", "floor": 3, "hp": 60, "max_hp": 80,
+            "deck": ["Strike", "Defend"], "relics": ["Burning Blood"],
+            "offered": ["Good", "A", "B"]}' | python -c "
+          import json, sys
+          b = json.load(sys.stdin)
+          assert b['suggestion'] == 'GOOD', b
+          assert all(r['win_chance'] is not None for r in b['ranking']), b
+          print('rank ok:', b['suggestion'], b['win_suggestion'])"
+
+      - name: Container health and logs
+        if: always()
+        run: |
+          docker inspect --format '{{json .State.Health}}' advisor || true
+          docker logs advisor || true

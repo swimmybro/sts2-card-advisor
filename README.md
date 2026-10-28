@@ -7,6 +7,9 @@ Requires Python 3.9+.
 
 ```bash
 python3 -m venv .venv
+```
+
+```bash
 .venv/bin/pip install -r requirements.txt
 ```
 
@@ -168,6 +171,23 @@ curl -s -X POST http://127.0.0.1:8000/rank -H 'Content-Type: application/json' -
 Card names are forgiving: `"Shrug It Off"`, `"shrug_it_off"` and `"CARD.SHRUG_IT_OFF"` all work, and a trailing `+` marks an upgraded card. `deck` is the deck *before* the pick, and `relics` is every relic you hold. Features are computed with the same code as the training data (`features.reward_rows`).
 
 The response's `suggestion` is the top-ranked option. `ranking` lists every option with its model score; higher is better, and scores are only meaningful relative to each other. Cards the model never saw in training, often typos, get `known: false` and are listed in `unknown_cards`. Treat their scores with suspicion.
+
+### Running in Docker
+
+The image holds the API code and card list. Your trained models are mounted in at run time:
+
+```bash
+docker build -t sts2-card-advisor .
+```
+
+```bash
+docker run -p 8000:8000 -v "$PWD/models:/app/models:ro" sts2-card-advisor
+```
+
+- `models/card_pick` is required. `models/win_prob` is optional and adds win chances.
+- The image installs only [`requirements-serve.txt`](requirements-serve.txt), what the API needs at runtime. [`requirements.txt`](requirements.txt) adds MLflow and the test tools for training and development.
+- The image runs as a non-root user and has a health check on `/health`.
+- CI builds the image on every push, starts it with tiny demo models trained on synthetic data ([`tests/make_demo_models.py`](tests/make_demo_models.py)), and checks `/health` and `/rank`.
 
 ## Tests
 

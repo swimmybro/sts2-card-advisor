@@ -118,6 +118,11 @@ def test_invalid_requests_rejected(client, bad):
     assert client.post("/rank", json=state(**bad)).status_code == 422
 
 
+def test_missing_pick_model_gives_clear_error(tmp_path):
+    with pytest.raises(RuntimeError, match="No pick model"):
+        create_app(model_dir=tmp_path / "nothing_here")
+
+
 def test_normalize_card():
     assert normalize_card("Shrug It Off") == ("SHRUG_IT_OFF", False)
     assert normalize_card("CARD.BASH+") == ("BASH", True)

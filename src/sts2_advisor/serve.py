@@ -119,6 +119,10 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
     """Build the app. Paths default to ``$MODEL_DIR``, ``$CARD_META`` and
     ``$WIN_MODEL_DIR``; the win model is optional and skipped if missing."""
     model_dir = Path(model_dir or os.environ.get("MODEL_DIR", DEFAULT_MODEL_DIR))
+    if not (model_dir / "model.txt").exists():
+        raise RuntimeError(
+            f"No pick model at {model_dir}. Train one with `python -m sts2_advisor.train`, "
+            "or set MODEL_DIR (in Docker, mount your models: -v \"$PWD/models:/app/models:ro\").")
     meta = load_card_meta(Path(card_meta or os.environ.get("CARD_META", DEFAULT_CARD_META)))
     booster, categories = load_model(model_dir)
     win_dir = Path(win_model_dir or os.environ.get("WIN_MODEL_DIR", DEFAULT_WIN_MODEL_DIR))

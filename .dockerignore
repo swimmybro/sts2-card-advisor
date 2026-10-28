@@ -1,0 +1,7 @@
+# Only send what the image needs to the build (data, models, .venv and mlruns
+# can be gigabytes).
+*
+!requirements-serve.txt
+!src/
+!configs/cards.csv
+**/__pycache__
