@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from sts2_advisor.features import DEFAULT_CARD_META, load_card_meta
-from sts2_advisor.train import load_model, predict
+from sts2_advisor.train import add_pick_features, load_model, predict
 from sts2_advisor.win import adjust_win_chances, near_best, pick_probabilities
 
 DEFAULT_MODEL_DIR = Path("models/card_pick")
@@ -65,9 +65,18 @@ class Advisor:
         ``win``. With reliability settings, ``win`` is the adjusted chance and
         ``pick_chance``, ``low_confidence`` and ``tied`` (within the tie margin
         of the reward's best, when two or more are) are added too.
+
+        ``suggested`` marks each reward's recommended option and
+        ``suggestion_source`` says how it was chosen: the highest win chance
+        (``win_model``); among options tied on win chance, the one players take
+        most (``win_tie_popular``), since win chances can't separate them but
+        players' picks often reflect synergies; or, without a win model, what
+        players take most (``pick_model``).
         """
         rows = rows.copy()
         rows["score"] = predict(*self.pick, rows)
+        if self.win and self.win[1].get("pick_features"):  # win model uses the pick model's view
+            rows = add_pick_features(rows.assign(pick_score=rows["score"]))
         rows["raw_win"] = predict(*self.win, rows) if self.win else np.nan
         rows["win"] = rows["raw_win"]
         rows["pick_chance"] = np.nan
@@ -82,4 +91,19 @@ class Advisor:
             rows["low_confidence"] = rows["pick_chance"] < rel["low_confidence_below"]
             close = pd.Series(near_best(ids, rows["win"], rel["tie_margin"]), index=rows.index)
             rows["tied"] = close & (close.groupby(ids).transform("sum") > 1)
-        return rows
+        return _suggest(rows, has_win=self.win is not None)
+
+
+def _suggest(rows: pd.DataFrame, has_win: bool) -> pd.DataFrame:
+    """Mark each reward's recommended option (see :meth:`Advisor.score`)."""
+    ids = rows["offer_id"].to_numpy()
+    if has_win:
+        tie = rows["tied"].astype(bool).groupby(ids).transform("any").to_numpy()
+        # in a tie, rank the tied options by the pick model; otherwise by win chance
+        key = np.where(tie, np.where(rows["tied"].astype(bool), rows["score"], -np.inf),
+                       rows["win"])
+        source = np.where(tie, "win_tie_popular", "win_model")
+    else:
+        key, source = rows["score"].to_numpy(), np.full(len(rows), "pick_model")
+    best = pd.Series(key, index=rows.index).groupby(ids).idxmax()
+    return rows.assign(suggested=rows.index.isin(best.to_numpy()), suggestion_source=source)

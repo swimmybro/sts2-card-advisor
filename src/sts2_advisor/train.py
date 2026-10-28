@@ -43,6 +43,8 @@ CATEGORICAL_FEATURES = ["character", "candidate", "cand_type", "cand_rarity", "r
 FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 # Relics get one 0/1 column each (relic_<ID>) for the most common ones in training.
 MAX_RELIC_FEATURES = 60
+# The pick model's view of each option, an input to the win model (add_pick_features).
+PICK_FEATURES = ["pick_rel", "pick_prob"]
 EVAL_SPLITS = {"test": "Community test set",
                "test_won": "Community test set, winning runs only",
                "mine": "Your runs (held out)"}
@@ -235,6 +237,12 @@ def to_matrix(df: pd.DataFrame, categories: Dict[str, List[str]]) -> pd.DataFram
         flags = np.zeros((len(df), len(tracked)), dtype=np.float32)
         flags[rows[col >= 0], col[col >= 0]] = 1.0
         extra.append(pd.DataFrame(flags, index=X.index, columns=[f"relic_{r}" for r in tracked]))
+    if categories.get("pick_features"):
+        missing = [c for c in PICK_FEATURES if c not in df]
+        if missing:
+            raise ValueError("this model uses the pick model's scores: add them with "
+                             "add_pick_features() first")
+        extra.append(df[PICK_FEATURES].astype("float32"))
     cards = categories.get("deck_cards", [])
     if cards:
         counts = (deck_card_counts(df["deck_cards"], cards) if "deck_cards" in df
@@ -375,6 +383,63 @@ def compare_top_picks(df: pd.DataFrame, ours: np.ndarray, theirs: np.ndarray,
     }
 
 
+# ------------------------------------------------- pick scores for the win model
+
+def add_pick_features(df: pd.DataFrame) -> pd.DataFrame:
+    """From ``pick_score`` (the pick model's score for each option), add each
+    option's score relative to its reward's best (``pick_rel``) and its share of
+    the pick model's preference within the reward (``pick_prob``)."""
+    ids = df["offer_id"].to_numpy()
+    s = pd.Series(df["pick_score"].to_numpy(dtype=np.float64), index=df.index)
+    best = s.groupby(ids).transform("max")
+    e = np.exp(s - best)
+    df = df.assign(pick_rel=(s - best).astype("float32"),
+                   pick_prob=(e / e.groupby(ids).transform("sum")).astype("float32"))
+    return df
+
+
+def oof_pick_scores(cfg: Dict[str, Any], final_pick_dir: Path, out: Path,
+                    folds: int = 3) -> Dict[str, Any]:
+    """Pick-model scores for every row, for use as a win-model input.
+
+    Training rows are scored by pick models trained on the *other* folds of
+    the training runs (out-of-fold), so their scores are as good as on unseen
+    runs, not better. All other rows get the final pick model's score, which
+    is what the API uses. Saved in :func:`load_offers` row order.
+    """
+    df = load_offers(Path(cfg["data"]["offers"]))
+    parts = split_data(df, cfg)
+    scores = np.full(len(df), np.nan, dtype=np.float32)
+    final = load_model(final_pick_dir)
+    others = df.index.difference(parts["train"].index)
+    scores[others] = predict(*final, df.loc[others])
+
+    train, valid = parts["train"], parts["valid"]
+    groups = train["group"].unique()
+    rng = np.random.default_rng(cfg["split"]["seed"] + 2)
+    fold_of = dict(zip(rng.permutation(groups), np.arange(len(groups)) % folds))
+    fold = train["group"].map(fold_of).to_numpy()
+    for k in range(folds):
+        booster, cats = train_ranker(train[fold != k], valid, cfg)
+        held = train[fold == k]
+        scores[held.index] = predict(booster, cats, held)
+        log.info("pick-score fold %d/%d done", k + 1, folds)
+        del booster
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"pick_score": scores}).to_parquet(out)
+    return {"rows": int(len(df)), "folds": folds}
+
+
+def attach_pick_scores(df: pd.DataFrame, path: Path) -> pd.DataFrame:
+    """Add saved pick scores (same row order as :func:`load_offers`) and the
+    features derived from them."""
+    s = pd.read_parquet(path)["pick_score"].to_numpy()
+    if len(s) != len(df):
+        raise ValueError(f"{path} has {len(s)} rows but the offers have {len(df)}: "
+                         "rebuild pick scores after rebuilding features")
+    return add_pick_features(df.assign(pick_score=s))
+
+
 # ------------------------------------------------------------------------- main
 
 def run(cfg: Dict[str, Any], compare_with: Optional[Path] = None) -> Dict[str, Any]:
@@ -498,11 +563,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--config", type=Path, default=Path("configs/train.yaml"))
     ap.add_argument("--compare-with", type=Path, metavar="MODEL_DIR",
                     help="a saved model to compare top picks against on the test set")
+    ap.add_argument("--oof-scores", type=Path, metavar="PARQUET",
+                    help="instead of training, write out-of-fold pick scores for the win "
+                         "model, using the trained model in output.model_dir for other rows")
+    ap.add_argument("--folds", type=int, default=3)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(levelname)s %(message)s")
     cfg = yaml.safe_load(args.config.read_text())
+    if args.oof_scores:
+        oof_pick_scores(cfg, Path(cfg["output"]["model_dir"]), args.oof_scores, args.folds)
+        print(f"Wrote pick scores to {args.oof_scores}")
+        return
     metrics = run(cfg, compare_with=args.compare_with)
     print(report(metrics))
     print(f"\nSaved model to {cfg['output']['model_dir']}")

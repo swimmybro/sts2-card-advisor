@@ -64,10 +64,14 @@ def test_win_model_drives_the_suggestion(win_client):
     chances = [r["win_chance"] for r in body["ranking"]]
     assert {r["card"] for r in body["ranking"]} == {"GOOD", "A", "B", "SKIP"}
     assert all(0.0 <= c <= 1.0 for c in chances)
-    assert chances == sorted(chances, reverse=True)  # ranked by win chance
-    assert body["suggestion_source"] == "win_model"
-    assert body["suggestion"] == body["ranking"][0]["card"]
+    assert body["suggestion"] == body["ranking"][0]["card"]  # suggestion listed first
+    assert chances[1:] == sorted(chances[1:], reverse=True)  # the rest by win chance
     assert body["popular_choice"] == "GOOD"  # what players take, from the pick model
+    if body["suggestion_source"] == "win_model":
+        assert chances[0] == max(chances)
+    else:  # several tied on win chance: the one players take most
+        assert body["suggestion_source"] == "win_tie_popular"
+        assert body["suggestion"] in body["win_tied"]
 
 
 def test_reliability_fields(win_client):
@@ -81,7 +85,8 @@ def test_reliability_fields(win_client):
     assert ranking["GOOD"]["low_confidence"] is False
     assert isinstance(body["win_tied"], list)
     if body["win_tied"]:
-        assert body["suggestion"] == body["win_tied"][0] and len(body["win_tied"]) > 1
+        assert len(body["win_tied"]) > 1 and body["suggestion"] in body["win_tied"]
+        assert body["suggestion_source"] == "win_tie_popular"
 
 
 def test_rank_suggests_learned_pick(client):

@@ -32,7 +32,7 @@ def _dies_abruptly():
 
 def test_killed_step_gives_clear_error():
     assert pipeline._in_fresh_process("adding", sum, [1, 2]) == 3
-    with pytest.raises(RuntimeError, match="crashing was killed.*out of memory"):
+    with pytest.raises(RuntimeError, match="crashing stopped before finishing.*out of memory"):
         pipeline._in_fresh_process("crashing", _dies_abruptly)
 
 
@@ -115,6 +115,20 @@ def test_pipeline_end_to_end(setup):
     assert second["candidate"]["pick_top1"] == pytest.approx(second["current"]["pick_top1"])
     assert second["decision"]["promote"] is True
     assert len(list((tmp / "archive").iterdir())) == 1
+
+
+def test_pipeline_with_pick_scores_for_the_win_model(setup):
+    tmp, cfg, kw = setup
+    win = yaml.safe_load((tmp / "win.yaml").read_text())
+    win["features"] = {"pick_scores": True}
+    (tmp / "win.yaml").write_text(yaml.safe_dump(win))
+    result = run_pipeline(cfg, **kw)
+    assert "pick_scores" in result["steps"]  # the out-of-fold step ran
+    assert result["decision"]["promote"] is True
+    cats = json.loads((tmp / "models" / "win_prob" / "categories.json").read_text())
+    assert cats.get("pick_features") is True
+    # (no AUC check: 150 synthetic runs are too few for any win model to learn from)
+    assert "win_auc" in result["candidate"]
 
 
 def test_pipeline_keeps_better_current_models(setup, monkeypatch):

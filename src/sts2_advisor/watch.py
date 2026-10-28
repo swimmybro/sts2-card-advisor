@@ -134,13 +134,14 @@ def review_run(path: Path, advisor: Advisor) -> RunReview:
                "yours": _label(yours), "pick_top": _label(pick_top),
                "agrees_pick": bool(yours["candidate"] == pick_top["candidate"])}
         if has_win:
-            win_top = g.loc[g["win"].idxmax()]
+            best = g[g["suggested"]].iloc[0]  # highest win chance, ties broken by popularity
             rec.update(
-                win_top=_label(win_top), your_win=float(yours["win"]),
-                best_win=float(win_top["win"]),
-                best_low_confidence=bool(win_top["low_confidence"]),
+                win_top=_label(best), your_win=float(yours["win"]),
+                best_win=float(best["win"]),
+                best_low_confidence=bool(best["low_confidence"]),
+                tie_broken=best["suggestion_source"] == "win_tie_popular",
                 # a pick tied with the best counts as agreeing with the win model
-                agrees_win=bool(yours["candidate"] == win_top["candidate"] or yours["tied"]),
+                agrees_win=bool(yours["candidate"] == best["candidate"] or yours["tied"]),
                 tied=[_label(r) for _, r in g[g["tied"]].iterrows()])
             rec["gap"] = 0.0 if rec["agrees_win"] else rec["best_win"] - rec["your_win"]
         out.append(rec)
@@ -165,7 +166,7 @@ def format_review(review: RunReview, n_worst: int = 3) -> str:
     for x in r.itertuples():
         line = f"  F{x.floor:<3} {x.room:<8} {', '.join(x.offered):<44} you: {x.yours:<16}"
         if has_win:
-            best = "tie" if len(x.tied) > 1 and x.agrees_win else x.win_top
+            best = x.win_top + (" (tie)" if x.tie_broken else "")
             flag = " (low confidence)" if x.best_low_confidence and not x.agrees_win else ""
             line += (f" best: {best:<16} win {x.your_win:5.1%} vs {x.best_win:5.1%}{flag}"
                      f"   popular: {x.pick_top}")

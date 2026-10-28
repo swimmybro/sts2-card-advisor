@@ -35,7 +35,9 @@ import yaml
 
 from sts2_advisor.features import DEFAULT_CARD_META, build_offers, load_card_meta
 from sts2_advisor.parse import DEFAULT_CARD_ALLOWLIST, load_card_allowlist
-from sts2_advisor.train import evaluate, load_model, load_offers, predict, split_data
+from sts2_advisor.train import (
+    add_pick_features, evaluate, load_model, load_offers, oof_pick_scores, predict, split_data,
+)
 from sts2_advisor.train import run as train_pick
 from sts2_advisor.win import deck_sensitivity, outcome_metrics
 from sts2_advisor.win import run as train_win
@@ -55,13 +57,17 @@ def score_pair(parts: Dict[str, Any], pick_dir: Path, win_dir: Path,
     if not ((pick_dir / "model.txt").exists() and (win_dir / "model.txt").exists()):
         return None
     pick, win = load_model(pick_dir), load_model(win_dir)
-    out = {"pick_top1": evaluate(parts["test"], predict(*pick, parts["test"]))["top1"]}
+    test = parts["test"]
+    pick_scores = predict(*pick, test)
+    out = {"pick_top1": evaluate(test, pick_scores)["top1"]}
     if not parts["mine"].empty:
         out["pick_top1_mine"] = evaluate(parts["mine"], predict(*pick, parts["mine"]))["top1"]
-    w = outcome_metrics(parts["test"], *win)
+    if win[1].get("pick_features"):  # the win model takes this pair's pick scores as input
+        test = add_pick_features(test.assign(pick_score=pick_scores))
+    w = outcome_metrics(test, *win)
     out.update(win_auc=w["auc"], win_log_loss=w["log_loss"])
     if meta is not None:
-        s = deck_sensitivity(parts["test"], *win, meta)
+        s = deck_sensitivity(test, *win, meta, pick=pick)
         out.update(deck_top_changed=s["top_pick_changed"],
                    deck_relative_change=s["mean_relative_change"])
     return out
@@ -111,8 +117,8 @@ def _in_fresh_process(step: str, fn, *args, **kwargs):
         try:
             return ex.submit(fn, *args, **kwargs).result()
         except BrokenProcessPool as e:
-            raise RuntimeError(f"{step} was killed before finishing, most likely by running "
-                               "out of memory") from e
+            raise RuntimeError(f"{step} stopped before finishing: its process was killed or "
+                               "crashed, most often from running out of memory") from e
 
 
 def _build_features(inputs: List[str], offers: Path, card_meta: Path,
@@ -151,8 +157,16 @@ def run_pipeline(cfg: Dict[str, Any], skip_features: bool = False, force: bool =
     _in_fresh_process("pick model training", train_pick, pick_cfg)
     result["steps"]["pick_model"] = {"seconds": round(time.time() - t)}
     t = time.time()
+    pick_scores = None
+    if (win_cfg.get("features") or {}).get("pick_scores"):
+        pick_scores = staging / "pick_scores.parquet"
+        _in_fresh_process("pick scores for the win model", oof_pick_scores, pick_cfg,
+                          staging / "card_pick", pick_scores, cfg.get("pick_score_folds", 3))
+        result["steps"]["pick_scores"] = {"seconds": round(time.time() - t)}
+        t = time.time()
     _in_fresh_process("win model training", train_win, win_cfg,
-                      pick_model=staging / "card_pick", card_meta=card_meta)
+                      pick_model=staging / "card_pick", card_meta=card_meta,
+                      pick_scores=pick_scores)
     result["steps"]["win_model"] = {"seconds": round(time.time() - t)}
 
     t = time.time()

@@ -4,13 +4,18 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from sts2_advisor.advise import Advisor
 from sts2_advisor.features import OFFER_COLUMNS, SKIP, decks_path
+from sts2_advisor.train import (
+    add_pick_features, attach_pick_scores, load_model, load_offers, oof_pick_scores, predict,
+    split_data,
+)
 from sts2_advisor.train import run as run_pick_model
 from sts2_advisor.win import (
     adjust_win_chances, auc, calibration, fit_temperature, near_best, outcome_rows,
     pick_probabilities, run,
 )
-from test_train import config as pick_config, rows
+from test_train import config as pick_config, rows, synthetic_offers
 
 
 def popular_vs_good_offers(n_runs=400, seed=0):
@@ -157,6 +162,85 @@ def test_deck_cards_let_the_win_model_learn_synergy(tmp_path, deck_cards, expect
         assert metrics["test"]["outcome"]["auc"] > 0.75
     else:
         assert s["top_pick_changed"] < 0.05  # can't see Y, so the deck barely matters
+
+
+def test_add_pick_features():
+    df = pd.DataFrame({"offer_id": [0, 0, 1, 1, 1], "pick_score": [2.0, 0.0, 1.0, 1.0, 1.0]})
+    out = add_pick_features(df)
+    assert out["pick_rel"].tolist() == [0.0, -2.0, 0.0, 0.0, 0.0]
+    assert out["pick_prob"].tolist() == pytest.approx([1 / (1 + np.exp(-2)), np.exp(-2) / (1 + np.exp(-2)),
+                                                      1 / 3, 1 / 3, 1 / 3])
+
+
+def players_know_synergy_offers(n_runs=3000, seed=0):
+    """Players take X when the deck has poison and Z otherwise (players know the
+    synergy), and the right pick wins more often."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for r in range(n_runs):
+        poison = bool(rng.random() < 0.5)
+        right = "X" if poison else "Z"
+        pick = right if rng.random() < 0.9 else ("Z" if right == "X" else "X")
+        won = bool(rng.random() < (0.7 if pick == right else 0.3))
+        out += rows(f"r{r}:1", ["X", "Z", SKIP], pick, source="codex", floor=5, act=1,
+                    ascension=5, n_offered=2, hp_frac=0.5, deck_poison=float(poison),
+                    deck_cards="POISONER|STRIKE" if poison else "DEFEND|STRIKE",
+                    deck_size=2.0, run_won=won)
+    return pd.DataFrame(out, columns=OFFER_COLUMNS + ["deck_cards"])
+
+
+def test_win_model_with_pick_scores_follows_the_deck(tmp_path):
+    """The mechanism works end to end: out-of-fold pick scores in, a win model
+    whose choice flips with the deck out, and the API scoring with it. (Whether
+    pick scores *help* is a question for the real data: in a toy set with one
+    obvious poison column, the win model learns the synergy fine on its own.)"""
+    write_offers_with_decks(players_know_synergy_offers(), tmp_path / "offers.parquet")
+    run_pick_model(pick_config(tmp_path))  # pick model -> tmp_path/model
+    scores = tmp_path / "pick_scores.parquet"
+    oof_pick_scores(pick_config(tmp_path), tmp_path / "model", scores, folds=3)
+
+    cfg = win_config(tmp_path)
+    cfg["features"] = {"pick_scores": True}
+    cfg["output"] = {"model_dir": str(tmp_path / "win")}
+    m = run(cfg, pick_model=tmp_path / "model", pick_scores=scores)
+    # swapping a poison deck for a non-poison one (half the swaps) flips X <-> Z
+    assert m["deck_sensitivity"]["top_pick_changed"] > 0.3
+    assert any(f.startswith("pick_") for f in list(m["feature_importance"])[:3])
+
+    advisor = Advisor(tmp_path / "model", None, tmp_path / "win")
+    d = players_know_synergy_offers(n_runs=2)
+    scored = advisor.score(d.drop(columns="deck_cards"))
+    assert {"pick_rel", "pick_prob"} <= set(scored) and scored["raw_win"].notna().all()
+
+
+def test_oof_pick_scores(tmp_path):
+    df = synthetic_offers(n_runs=120)
+    df.to_parquet(tmp_path / "offers.parquet")
+    cfg = pick_config(tmp_path)
+    run_pick_model(cfg)
+    out = tmp_path / "scores.parquet"
+    assert oof_pick_scores(cfg, tmp_path / "model", out, folds=3) == {"rows": len(df), "folds": 3}
+    scores = pd.read_parquet(out)["pick_score"].to_numpy()
+    assert len(scores) == len(df) and not np.isnan(scores).any()
+
+    loaded = load_offers(tmp_path / "offers.parquet")
+    parts = split_data(loaded, cfg)
+    final = predict(*load_model(tmp_path / "model"), loaded)
+    others = loaded.index.difference(parts["train"].index)
+    assert np.allclose(scores[others], final[others], atol=1e-5)  # final model for non-training rows
+    train_idx = parts["train"].index
+    assert not np.allclose(scores[train_idx], final[train_idx])  # out-of-fold for training rows
+
+    with pytest.raises(ValueError, match="rebuild pick scores"):
+        attach_pick_scores(loaded.iloc[:10], out)
+
+
+def test_win_model_with_pick_scores_needs_them(tmp_path):
+    synthetic_offers(n_runs=40).to_parquet(tmp_path / "offers.parquet")
+    cfg = win_config(tmp_path)
+    cfg["features"] = {"pick_scores": True}
+    with pytest.raises(ValueError, match="needs --pick-model and --pick-scores"):
+        run(cfg)
 
 
 def test_no_reliability_without_pick_model(tmp_path):

@@ -137,6 +137,9 @@ PYTHONPATH=src .venv/bin/python -m sts2_advisor.win --config configs/win.yaml --
   - how often it suggests skipping, and how big the gap is between a reward's best and worst options
   - which cards it favours more or less than players do
   - **deck sensitivity:** test rewards are scored again with a different real deck from a reward of the same character and act, keeping everything else the same. It reports how often the top option changes, and how much the options' win chances move relative to each other. A model that ignores the deck scores near zero.
+- **The pick model's view as an input** (`features.pick_scores` in `configs/win.yaml`): players already pick synergy cards for their decks, and the pick model has learned that. Each option gets `pick_rel` (its pick score minus the reward's best) and `pick_prob` (its share of the pick model's preference within the reward), and the win model learns from outcomes how far to trust them.
+  - **Avoiding over-trust:** a pick model scores its own training runs too well, so training runs are scored *out-of-fold*. The training runs are split into 3 parts, and each part is scored by a pick model trained on the other two. All other rows use the final pick model, the one the API uses.
+  - **Producing the scores:** the pipeline does it automatically. By hand, train the pick model, then run `python -m sts2_advisor.train --oof-scores pick_scores.parquet`, and pass `--pick-scores pick_scores.parquet --pick-model models/card_pick` to `sts2_advisor.win`.
 - **Output:** saved to `models/win_prob/` and logged to MLflow under the `win-prob` experiment.
 
 It learns from outcomes, but it's still correlational. Stronger players both win more and pick differently, so a card can look good partly because good players take it.
@@ -182,7 +185,10 @@ curl -s -X POST http://127.0.0.1:8000/rank -H 'Content-Type: application/json' -
 Card names are forgiving: `"Shrug It Off"`, `"shrug_it_off"` and `"CARD.SHRUG_IT_OFF"` all work, and a trailing `+` marks an upgraded card. `deck` is the deck *before* the pick, and `relics` is every relic you hold. Features are computed with the same code as the training data (`features.reward_rows`).
 
 The response:
-- **`suggestion`:** the option with the highest win chance. `suggestion_source` says `win_model`, or `pick_model` when no win model is loaded.
+- **`suggestion`:** the recommended option, listed first in `ranking`. `suggestion_source` says how it was chosen:
+  - **`win_model`:** the option with the highest win chance.
+  - **`win_tie_popular`:** when two or more options are tied on win chance (within the tie margin, listed in `win_tied`), the tied option players take most. In close calls, win chances can't separate the options, but players' picks often reflect card synergies. For example, with poison in a Silent deck, Snakebite, Backflip and Accuracy are within a point on win chance, and players reliably take Snakebite.
+  - **`pick_model`:** no win model is loaded, so it's what players take most.
 - **`popular_choice`:** what players most often take in this spot, from the pick model.
 - **`ranking`:** every option, best first by win chance, with its `win_chance` and its pick-model `score` (higher means players take it more; only meaningful relative to the other options).
 - **Unknown cards:** cards the models never saw in training, often typos, get `known: false` and are listed in `unknown_cards`. Treat their numbers with suspicion.
@@ -221,7 +227,7 @@ PYTHONPATH=src .venv/bin/python -m sts2_advisor.watch
 For each solo run, the review lists every card reward with:
 - the options offered
 - your pick
-- the best option by win chance ("tie" when you picked one of several equally good options), with the win chance of your pick against the best
+- the best option, chosen by the same rule as the API's `suggestion` and marked "(tie)" when the popular choice broke a tie, with the win chance of your pick against it. Picking any of the tied options counts as taking the best.
 - the popular option (what players most often take)
 
 It ends with how often you took the best and the popular option, and the rewards where the best option's win chance most exceeded your pick's. Co-op runs are copied but not reviewed.
@@ -269,8 +275,8 @@ PYTHONPATH=src .venv/bin/python -m sts2_advisor.pipeline
 ```
 
 1. **Features:** rebuilds `data/processed/offers.parquet` from `data/raw` and `data/external`. `--skip-features` reuses the existing file.
-2. **Training:** trains a new pick model and win model into `models/staging/`, using `configs/train.yaml` and `configs/win.yaml`.
-3. **Comparison:** scores the new and the current models (`models/card_pick`, `models/win_prob`) on the same test set: pick-model top-1 on community runs and on your runs, plus win-model AUC and log loss.
+2. **Training:** trains a new pick model and win model into `models/staging/`, using `configs/train.yaml` and `configs/win.yaml`. In between, it produces the out-of-fold pick scores the win model takes as input (3 extra pick models; `pick_score_folds` in the pipeline config). Each heavy step runs in its own process, so its memory is fully released before the next.
+3. **Comparison:** scores the new and the current models (`models/card_pick`, `models/win_prob`) on the same test set: pick-model top-1 on community runs and on your runs, win-model AUC and log loss, and deck sensitivity.
 4. **Promotion:** if neither new model is worse beyond the tolerance in [`configs/pipeline.yaml`](configs/pipeline.yaml), the current pair moves to `models/archive/<time>/` and the new pair takes its place. The models are promoted or kept together, so the win model's reliability settings always match the pick model beside it. If the new models are worse, they stay in `models/staging/` for inspection. `--force` promotes them regardless.
 
 To restore an archived pair, move its `card_pick` and `win_prob` folders back into `models/`.

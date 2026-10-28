@@ -32,8 +32,8 @@ from sts2_advisor.features import (
     DEFAULT_CARD_META, TRAIT_COLUMNS, _deck_totals, load_card_meta, option_deltas,
 )
 from sts2_advisor.train import (
-    CATEGORICAL_FEATURES, fit_categories, load_model, load_offers, log_to_mlflow,
-    predict, save_model, split_data, to_matrix, top_picks,
+    CATEGORICAL_FEATURES, add_pick_features, attach_pick_scores, fit_categories, load_model,
+    load_offers, log_to_mlflow, predict, save_model, split_data, to_matrix, top_picks,
 )
 
 log = logging.getLogger(__name__)
@@ -105,7 +105,10 @@ def train_win_model(train: pd.DataFrame, valid: pd.DataFrame, cfg: Dict[str, Any
     early = m.pop("early_stopping_rounds")
     params = dict(m, verbose=-1, seed=cfg["split"]["seed"])
     tr, va = outcome_rows(train), outcome_rows(valid)
-    categories = fit_categories(tr, n_deck_cards=(cfg.get("features") or {}).get("deck_cards", 0))
+    features = cfg.get("features") or {}
+    categories = fit_categories(tr, n_deck_cards=features.get("deck_cards", 0))
+    if features.get("pick_scores"):
+        categories["pick_features"] = True
     dtrain = lgb.Dataset(to_matrix(tr, categories), label=tr["run_won"].astype(int),
                          categorical_feature=CATEGORICAL_FEATURES)
     dvalid = lgb.Dataset(to_matrix(va, categories), label=va["run_won"].astype(int),
@@ -216,15 +219,20 @@ DECK_COLUMNS = ["deck_size", "deck_attacks", "deck_skills", "deck_powers", "deck
 
 
 def deck_sensitivity(df: pd.DataFrame, booster: lgb.Booster, categories: Dict[str, List[str]],
-                     meta: Dict[str, dict], n: int = 20000, seed: int = 0) -> Dict[str, float]:
+                     meta: Dict[str, dict], n: int = 20000, seed: int = 0,
+                     pick: Optional[Tuple[lgb.Booster, Dict[str, List[str]]]] = None
+                     ) -> Dict[str, float]:
     """How much the model's advice depends on the deck.
 
     For a sample of rewards, swap in the deck from another reward of the same
     character and act (keeping everything else: the offered cards, HP, relics,
     floor) and score again. Reports how often the top option changes, and how
     much each option's win chance moves *relative to the reward's average*
-    (so a deck that's simply stronger overall doesn't count).
+    (so a deck that's simply stronger overall doesn't count). If the win model
+    uses the pick model's scores, ``pick`` rescores the swapped rows too.
     """
+    if categories.get("pick_features") and pick is None:
+        raise ValueError("this win model uses pick scores: pass the pick model")
     rng = np.random.default_rng(seed)
     offers = df[df["is_skip"].to_numpy()].drop_duplicates("offer_id")
     if len(offers) < 2 or ("deck_cards" not in df and df.attrs.get("decks") is None):
@@ -262,11 +270,14 @@ def deck_sensitivity(df: pd.DataFrame, booster: lgb.Booster, categories: Dict[st
         for c, s, (_, row) in zip(cards, is_skip, swapped[list(TRAIT_COLUMNS.values())].iterrows())]
     if "deck_upgraded" in df:  # each option's change to the swapped-in deck's measures
         n_up = swapped["deck_upgraded"].fillna(0).astype(int).to_numpy()
-        upgraded = swapped["cand_upgraded"].fillna(False).astype(bool).to_numpy()
+        upgraded = swapped["cand_upgraded"].astype("boolean").fillna(False).to_numpy(dtype=bool)
         deltas = [option_deltas(_deck_totals(Counter(deck), meta), u, None if s else c, up, meta)
                   for deck, u, c, up, s in zip(decks, n_up, cards, upgraded, is_skip)]
         for k in deltas[0] if deltas else ():
             swapped[k] = [d[k] for d in deltas]
+    if categories.get("pick_features"):  # what players would take with the swapped deck
+        rows = add_pick_features(rows.assign(pick_score=predict(*pick, rows)))
+        swapped = add_pick_features(swapped.assign(pick_score=predict(*pick, swapped)))
 
     ids = rows["offer_id"].to_numpy()
     before, after = predict(booster, categories, rows), predict(booster, categories, swapped)
@@ -283,8 +294,19 @@ def deck_sensitivity(df: pd.DataFrame, booster: lgb.Booster, categories: Dict[st
 
 
 def run(cfg: Dict[str, Any], pick_model: Optional[Path] = None,
-        card_meta: Path = DEFAULT_CARD_META) -> Dict[str, Any]:
-    parts = split_data(load_offers(Path(cfg["data"]["offers"]), with_decks=True), cfg)
+        card_meta: Path = DEFAULT_CARD_META,
+        pick_scores: Optional[Path] = None) -> Dict[str, Any]:
+    """Train and evaluate the win model. With ``features.pick_scores`` in the
+    config, ``pick_scores`` (from :func:`train.oof_pick_scores`) and
+    ``pick_model`` are required."""
+    df = load_offers(Path(cfg["data"]["offers"]), with_decks=True)
+    if (cfg.get("features") or {}).get("pick_scores"):
+        if pick_scores is None or pick_model is None:
+            raise ValueError("features.pick_scores needs --pick-model and --pick-scores "
+                             "(python -m sts2_advisor.train --oof-scores ...)")
+        df = attach_pick_scores(df, pick_scores)
+    parts = split_data(df, cfg)
+    del df
     booster, categories = train_win_model(parts["train"], parts["valid"], cfg)
     metrics: Dict[str, Any] = {
         "best_iteration": booster.best_iteration,
@@ -306,7 +328,8 @@ def run(cfg: Dict[str, Any], pick_model: Optional[Path] = None,
         pick_scores = predict(*pick, d) if pick else None
         if split == "test":
             metrics["deck_sensitivity"] = deck_sensitivity(
-                d, booster, categories, load_card_meta(card_meta), seed=cfg["split"]["seed"])
+                d, booster, categories, load_card_meta(card_meta), seed=cfg["split"]["seed"],
+                pick=pick)
         metrics[split] = {"outcome": outcome_metrics(d, booster, categories),
                           "ranking": ranking_metrics(d, win_scores, pick_scores)}
         if reliability:
@@ -400,12 +423,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--config", type=Path, default=Path("configs/win.yaml"))
     ap.add_argument("--pick-model", type=Path, metavar="MODEL_DIR",
                     help="pick model to compare top options against")
+    ap.add_argument("--pick-scores", type=Path, metavar="PARQUET",
+                    help="out-of-fold pick scores (python -m sts2_advisor.train --oof-scores)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                         format="%(levelname)s %(message)s")
     cfg = yaml.safe_load(args.config.read_text())
-    metrics = run(cfg, pick_model=args.pick_model)
+    metrics = run(cfg, pick_model=args.pick_model, pick_scores=args.pick_scores)
     print(report(metrics))
     print(f"\nSaved model to {cfg['output']['model_dir']}")
 

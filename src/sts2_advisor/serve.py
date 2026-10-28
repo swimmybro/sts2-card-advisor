@@ -98,14 +98,17 @@ class RankResponse(BaseModel):
     suggestion: str = Field(
         description="The recommended option: highest win chance (or, without a win "
                     "model, what players most often take)")
-    suggestion_source: Literal["win_model", "pick_model"]
+    suggestion_source: Literal["win_model", "win_tie_popular", "pick_model"] = Field(
+        description="win_model: highest win chance. win_tie_popular: several options tied on "
+                    "win chance, so the one players take most. pick_model: no win model loaded.")
     popular_choice: str = Field(description="What players most often take here (pick model)")
     win_tied: List[str] = Field(
         default_factory=list,
         description="Options whose win chance is within the tie margin of the best; "
                     "empty unless two or more are effectively tied")
     ranking: List[RankedCard] = Field(
-        description="All options, best first (by win chance when a win model is loaded)")
+        description="All options: the suggestion first, then by win chance (or by pick "
+                    "score without a win model)")
     unknown_cards: List[str]
 
 
@@ -140,7 +143,9 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
         rows = advisor.score(rows)
         tied = rows[rows["tied"]].sort_values("win", ascending=False)["candidate"].tolist()
         popular = rows.loc[rows["score"].idxmax(), "candidate"]
-        rows = rows.sort_values("win" if advisor.win else "score", ascending=False)
+        source = rows["suggestion_source"].iloc[0]
+        rows = rows.sort_values(["suggested", "win" if advisor.win else "score"],
+                                ascending=False)
 
         def num(v):
             return None if np.isnan(v) else round(float(v), 4)
@@ -156,7 +161,7 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
         ]
         return RankResponse(
             suggestion=ranking[0].card,
-            suggestion_source="win_model" if advisor.win else "pick_model",
+            suggestion_source=source,
             popular_choice=popular,
             win_tied=tied,
             ranking=ranking,

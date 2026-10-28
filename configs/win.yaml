@@ -14,6 +14,12 @@ split:
 # the most common N cards in training decks (0 = deck summarized by counts only).
 features:
   deck_cards: 250
+  # Also give it the pick model's view of each option (what players would take),
+  # scored out-of-fold for training runs. Needs --pick-model and --pick-scores.
+  # Off: tried on the full data, the win model barely used it (0.3% of gain) and
+  # AUC moved 0.7842 -> 0.7844, for ~7 extra minutes per retrain. The API uses the
+  # pick model instead to break ties between options with equal win chances.
+  pick_scores: false
 
 model:
   objective: binary
