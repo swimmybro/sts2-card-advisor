@@ -237,6 +237,16 @@ def iter_parsed(paths: Iterable[Path], stats: ParseStats,
     If ``allowed_cards`` is given, runs with an unofficial character or any
     card outside the set are dropped as modded.
     """
+    for _, _, _, runs, choices in iter_kept_runs(
+            paths, stats, include_multiplayer, allowed_cards):
+        yield runs, choices
+
+
+def iter_kept_runs(paths: Iterable[Path], stats: ParseStats,
+                   include_multiplayer: bool = False,
+                   allowed_cards: Optional[Set[str]] = None,
+                   ) -> Iterator[Tuple[str, str, Dict[str, Any], List[dict], List[dict]]]:
+    """Like :func:`iter_parsed`, but also yields ``run_id``, ``source`` and the raw JSON."""
     seen = set()
     for run_id, source, data in iter_raw_runs(paths, stats):
         if len(data["players"]) > 1 and not include_multiplayer:
@@ -255,7 +265,7 @@ def iter_parsed(paths: Iterable[Path], stats: ParseStats,
         if allowed_cards is not None and _is_modded(runs, choices, allowed_cards):
             stats.n_modded += 1
             continue
-        yield runs, choices
+        yield run_id, source, data, runs, choices
 
 
 def parse_dir(paths: Iterable[Path], include_multiplayer: bool = False,

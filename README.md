@@ -42,6 +42,30 @@ Every row has a `source` column: `mine` for `.run` files, `codex` for exports. C
 - Unreadable or malformed runs are skipped with a warning and counted in the summary.
 - Pass `-v` to log progress on large exports.
 
+## Building card-pick features
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.features data/raw data/external
+```
+
+This writes `data/processed/offers.parquet`: one row per card in each post-combat card reward (monster, elite and boss rooms), plus one `SKIP` row per reward. Exactly one row per reward (`offer_id`) has `picked = True`.
+
+| Column group | Columns |
+| --- | --- |
+| Run context | `character`, `ascension`, `build_id`, `act`, `floor`, `room_type`, `hp`, `max_hp`, `hp_frac`, `gold`, `n_relics` |
+| Deck before the pick | `deck_size`, `deck_attacks`, `deck_skills`, `deck_powers`, `deck_curses` |
+| Candidate | `candidate`, `is_skip`, `cand_type`, `cand_rarity`, `cand_cost`, `cand_upgraded`, `cand_copies_in_deck`, `n_offered` |
+| Labels | `picked`; `run_won` (blank for abandoned runs); `floors_reached` |
+| Splitting | `group`: the player's `player_token` when known, otherwise the run |
+
+How it works and what it leaves out:
+
+- **Deck rebuild:** the deck at each reward comes from replaying every logged gain, removal and transform from the starting deck. The starting deck is the final deck with all those changes undone. Runs where this doesn't add up are dropped.
+- **Dropped runs:** also any run with impossible HP (edited saves).
+- **Left-out rewards:** rewards with more than one pick, which are usually two reward screens logged together.
+- **Card metadata:** type, rarity and cost come from [`configs/cards.csv`](configs/cards.csv), a snapshot of Spire Codex's `/api/cards`.
+- **Splitting:** use `features.split_by_group` for train/test splits, so no run (or player) lands on both sides.
+
 ## Tests
 
 ```bash
