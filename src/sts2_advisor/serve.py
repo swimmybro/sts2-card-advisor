@@ -13,8 +13,6 @@ Then open http://127.0.0.1:8000/docs for interactive docs.
 
 from __future__ import annotations
 
-import json
-import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -25,15 +23,9 @@ import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from sts2_advisor.features import (
-    DEFAULT_CARD_META, SKIP, load_card_meta, relic_fields, reward_rows,
-)
+from sts2_advisor.advise import Advisor
+from sts2_advisor.features import relic_fields, reward_rows
 from sts2_advisor.parse import OFFICIAL_CHARACTERS
-from sts2_advisor.train import load_model, predict
-from sts2_advisor.win import adjust_win_chances, near_best, pick_probabilities
-
-DEFAULT_MODEL_DIR = Path("models/card_pick")
-DEFAULT_WIN_MODEL_DIR = Path("models/win_prob")
 
 
 def normalize_id(name: str, prefix: str) -> str:
@@ -118,26 +110,8 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
                win_model_dir: Optional[Path] = None) -> FastAPI:
     """Build the app. Paths default to ``$MODEL_DIR``, ``$CARD_META`` and
     ``$WIN_MODEL_DIR``; the win model is optional and skipped if missing."""
-    model_dir = Path(model_dir or os.environ.get("MODEL_DIR", DEFAULT_MODEL_DIR))
-    if not (model_dir / "model.txt").exists():
-        raise RuntimeError(
-            f"No pick model at {model_dir}. Train one with `python -m sts2_advisor.train`, "
-            "or set MODEL_DIR (in Docker, mount your models: -v \"$PWD/models:/app/models:ro\").")
-    meta = load_card_meta(Path(card_meta or os.environ.get("CARD_META", DEFAULT_CARD_META)))
-    booster, categories = load_model(model_dir)
-    win_dir = Path(win_model_dir or os.environ.get("WIN_MODEL_DIR", DEFAULT_WIN_MODEL_DIR))
-    win = load_model(win_dir) if (win_dir / "model.txt").exists() else None
-    rel_path = win_dir / "reliability.json"
-    reliability = json.loads(rel_path.read_text()) if win and rel_path.exists() else None
-    known_cards = set(categories["candidate"])
-    metrics_path = model_dir / "metrics.json"
-    model_info = {"model_dir": str(model_dir), "win_model_dir": str(win_dir) if win else None,
-                  "reliability": reliability}
-    if metrics_path.exists():
-        m = json.loads(metrics_path.read_text())
-        model_info.update(best_iteration=m.get("best_iteration"),
-                          train_filter=m.get("train_filter"),
-                          test_top1=m.get("test", {}).get("model", {}).get("top1"))
+    advisor = Advisor(model_dir, card_meta, win_model_dir)
+    model_info = advisor.info()
 
     app = FastAPI(title="STS2 Card Advisor",
                   description="Ranks the cards in a Slay the Spire 2 card reward.")
@@ -157,19 +131,9 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
                 "floor": req.floor, "room_type": req.room_type, "hp": req.hp,
                 "max_hp": req.max_hp, "gold": req.gold,
                 **relic_fields(normalize_id(r, "relic") for r in req.relics)}
-        rows = pd.DataFrame(reward_rows(base, candidates, deck, meta))
-        rows["score"] = predict(booster, categories, rows)
-        rows["raw_win"] = predict(*win, rows) if win else np.nan
-        rows["win"], rows["pick_chance"], tied = rows["raw_win"], np.nan, []
-        if reliability:
-            one_reward = np.zeros(len(rows))
-            rows["pick_chance"] = pick_probabilities(one_reward, rows["score"],
-                                                     reliability["temperature"])
-            rows["win"], _ = adjust_win_chances(one_reward, rows["raw_win"],
-                                                rows["pick_chance"], reliability["shrink_k"])
-            close = near_best(one_reward, rows["win"], reliability["tie_margin"])
-            if close.sum() > 1:
-                tied = rows.loc[close].sort_values("win", ascending=False)["candidate"].tolist()
+        rows = pd.DataFrame(reward_rows(base, candidates, deck, advisor.meta)).assign(offer_id=0)
+        rows = advisor.score(rows)
+        tied = rows[rows["tied"]].sort_values("win", ascending=False)["candidate"].tolist()
         rows = rows.sort_values("score", ascending=False)
 
         def num(v):
@@ -179,18 +143,17 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
             RankedCard(card=r.candidate, upgraded=bool(r.cand_upgraded) if not r.is_skip else False,
                        is_skip=bool(r.is_skip), score=round(float(r.score), 4),
                        pick_chance=num(r.pick_chance), win_chance=num(r.win),
-                       raw_win_chance=num(r.raw_win) if reliability else None,
-                       low_confidence=(bool(r.pick_chance < reliability["low_confidence_below"])
-                                       if reliability else None),
-                       known=bool(r.is_skip) or r.candidate in known_cards)
+                       raw_win_chance=num(r.raw_win) if advisor.reliability else None,
+                       low_confidence=(bool(r.low_confidence) if advisor.reliability else None),
+                       known=bool(r.is_skip) or r.candidate in advisor.known_cards)
             for r in rows.itertuples()
         ]
         return RankResponse(
             suggestion=ranking[0].card,
-            win_suggestion=(rows.loc[rows["win"].idxmax(), "candidate"] if win else None),
+            win_suggestion=(rows.loc[rows["win"].idxmax(), "candidate"] if advisor.win else None),
             win_tied=tied,
             ranking=ranking,
-            unknown_cards=sorted({c["id"] for c in candidates} - known_cards),
+            unknown_cards=sorted({c["id"] for c in candidates} - advisor.known_cards),
         )
 
     return app

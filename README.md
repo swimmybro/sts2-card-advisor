@@ -189,6 +189,30 @@ docker run -p 8000:8000 -v "$PWD/models:/app/models:ro" sts2-card-advisor
 - The image runs as a non-root user and has a health check on `/health`.
 - CI builds the image on every push, starts it with tiny demo models trained on synthetic data ([`tests/make_demo_models.py`](tests/make_demo_models.py)), and checks `/health` and `/rank`.
 
+## Watching your runs
+
+`watch.py` copies new runs from the game's history folder into `data/raw` and reviews your card picks in each one:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.watch
+```
+
+- **Default:** checks every 30 seconds (`--interval`) until you stop it.
+- **`--once`:** copies new runs, reviews them, and exits.
+- **`--review latest`:** reviews a run already in `data/raw`. Instead of `latest`, you can pass a run ID or a file path.
+- **Finding the history folder:** on macOS it's found automatically under `~/Library/Application Support/SlayTheSpire2/steam/<steam-id>/profile*/saves/history`. If you have several profiles, the most recently used one is chosen. Set `STS2_HISTORY_DIR` or pass `--history` to choose it yourself.
+- **What gets copied:** only `.run` files not already in `data/raw`. Backups (`.run.backup`) are skipped, and so are files the game is still writing; they're picked up on the next check.
+
+For each solo run, the review lists every card reward with:
+- the options offered
+- your pick
+- the pick model's top option
+- the win model's top option ("tie" when you picked one of several equally good options), with the win chance of your pick against the best
+
+It ends with how often you agreed with each model, and the rewards where the win model most preferred a different option. Co-op runs are copied but not reviewed.
+
+Your own runs are held out from training, so the models are judging picks they haven't seen. Scoring uses the same code as the API ([`advise.py`](src/sts2_advisor/advise.py)).
+
 ## Tests
 
 ```bash
