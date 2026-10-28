@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from sts2_advisor.features import (
-    SKIP, BadHpError, DeckReplayError, FeatureStats, load_card_meta, main,
+    SKIP, BadHpError, DeckReplayError, FeatureStats, deck_string, load_card_meta, main,
     offer_rows, reward_rows, split_by_group, starting_deck,
 )
 from sts2_advisor.parse import ParseStats
@@ -220,6 +220,14 @@ def test_deck_traits_and_synergy():
     assert r["SHRUG"]["cand_synergy"] == 3 + 1  # 3 Block cards + 1 Draw card
     assert r["MYSTERY"]["cand_synergy"] == 0 and r["MYSTERY"]["cand_type"] is None
     assert r[SKIP]["cand_synergy"] is None
+
+
+def test_deck_cards_before_the_pick():
+    offers = by_offer(standard_rows())
+    assert offers[1]["ANGER"]["deck_cards"] == "DEFEND|STRIKE|STRIKE"  # starter only
+    # floor 4: STRIKE removed, ANGER added, DEFEND -> CLUMSY
+    assert offers[4][SKIP]["deck_cards"] == "ANGER|CLUMSY|STRIKE"
+    assert deck_string(Counter()) == ""
 
 
 def test_relics_held_at_each_reward():

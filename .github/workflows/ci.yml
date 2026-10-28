@@ -73,9 +73,10 @@ jobs:
             "offered": ["Good", "A", "B"]}' | python -c "
           import json, sys
           b = json.load(sys.stdin)
-          assert b['suggestion'] == 'GOOD', b
+          assert b['suggestion_source'] == 'win_model', b
+          assert b['popular_choice'] == 'GOOD', b
           assert all(r['win_chance'] is not None for r in b['ranking']), b
-          print('rank ok:', b['suggestion'], b['win_suggestion'])"
+          print('rank ok:', b['suggestion'], 'popular:', b['popular_choice'])"
 
       - name: Container health and logs
         if: always()

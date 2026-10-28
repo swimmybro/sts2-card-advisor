@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from sts2_advisor.features import OFFER_COLUMNS, SKIP
+from sts2_advisor.features import OFFER_COLUMNS, SKIP, decks_path
 from sts2_advisor.train import run as run_pick_model
 from sts2_advisor.win import (
     adjust_win_chances, auc, calibration, fit_temperature, near_best, outcome_rows,
@@ -119,6 +119,44 @@ def test_win_model_prefers_what_wins_over_what_is_popular(tmp_path):
     a = test["ranking_adjusted"]
     assert a["median_spread"] <= r["median_spread"]
     assert 0.0 <= a["tie_rate"] <= 1.0 and 0.0 <= a["raw_top_was_low_confidence"] <= 1.0
+
+
+def synergy_offers(n_runs=600, seed=0):
+    """X wins only with Y in the deck; Z wins only without it. Players pick at random,
+    so only a model that sees the deck's cards can tell X and Z apart."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for r in range(n_runs):
+        has_y = bool(rng.random() < 0.5)
+        deck = "STRIKE|Y" if has_y else "DEFEND|STRIKE"
+        pick = rng.choice(["X", "Z"])
+        won = (pick == "X") == has_y if rng.random() < 0.9 else bool(rng.random() < 0.5)
+        out += rows(f"r{r}:1", ["X", "Z", SKIP], pick, source="codex", floor=5, act=1,
+                    ascension=5, n_offered=2, hp_frac=0.5, deck_cards=deck,
+                    deck_size=2.0, run_won=won)
+    return pd.DataFrame(out, columns=OFFER_COLUMNS + ["deck_cards"])
+
+
+def write_offers_with_decks(df, path):
+    """Like build_offers: option rows, plus one deck per reward in the side file."""
+    df.drop(columns="deck_cards").to_parquet(path)
+    df[df["is_skip"]][["offer_id", "deck_cards"]].to_parquet(decks_path(path))
+
+
+@pytest.mark.parametrize("deck_cards, expect_flips", [(0, False), (10, True)])
+def test_deck_cards_let_the_win_model_learn_synergy(tmp_path, deck_cards, expect_flips):
+    write_offers_with_decks(synergy_offers(), tmp_path / "offers.parquet")
+    cfg = win_config(tmp_path)
+    cfg["features"] = {"deck_cards": deck_cards}
+    metrics = run(cfg)
+    s = metrics["deck_sensitivity"]
+    assert s["n_rewards"] > 0
+    if expect_flips:
+        # swapping in a deck with/without Y should flip the pick between X and Z
+        assert s["top_pick_changed"] > 0.2
+        assert metrics["test"]["outcome"]["auc"] > 0.75
+    else:
+        assert s["top_pick_changed"] < 0.05  # can't see Y, so the deck barely matters
 
 
 def test_no_reliability_without_pick_model(tmp_path):

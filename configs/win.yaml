@@ -10,6 +10,11 @@ split:
   seed: 0
   hold_out_mine: true
 
+# Give the model the deck's actual cards: one copy-count column per card, for
+# the most common N cards in training decks (0 = deck summarized by counts only).
+features:
+  deck_cards: 250
+
 model:
   objective: binary
   metric: binary_logloss

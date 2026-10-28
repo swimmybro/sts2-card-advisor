@@ -24,7 +24,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import yaml
 
-from sts2_advisor.features import TRAIT_COLUMNS, split_by_group
+from sts2_advisor.features import TRAIT_COLUMNS, decks_path, split_by_group
 
 log = logging.getLogger(__name__)
 
@@ -49,24 +49,86 @@ EVAL_SPLITS = {"test": "Community test set",
 LOAD_COLUMNS = FEATURES + ["relics_held", "offer_id", "group", "source", "picked", "run_won"]
 
 
-def load_offers(path: Path) -> pd.DataFrame:
+class DeckStore:
+    """Every reward's deck, parsed once into integer arrays.
+
+    ``cards[indptr[i]:indptr[i + 1]]`` are the card numbers (into ``vocab``)
+    of reward ``i``'s deck. Holding decks this way takes ~100 MB for 2M+
+    rewards, where per-row deck strings took many GB.
+    """
+
+    def __init__(self, decks: List[str]):
+        lists = pc.split_pattern(pa.array(decks, pa.string()), "|")
+        self.indptr = lists.offsets.to_numpy().astype(np.int64)
+        encoded = pc.dictionary_encode(pc.list_flatten(lists))  # no Python strings
+        self.vocab = np.asarray(encoded.dictionary.to_pylist(), dtype=object)
+        self.cards = encoded.indices.to_numpy().astype(np.int32)
+
+    def __deepcopy__(self, memo):
+        # pandas deep-copies df.attrs on every filter; the store is never modified,
+        # so share it instead of duplicating its arrays for each subset.
+        return self
+
+    def _tokens(self, ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """For rows with these deck numbers: (row index, card number) per deck card."""
+        starts, ends = self.indptr[ids], self.indptr[ids + 1]
+        lens = ends - starts
+        rows = np.repeat(np.arange(len(ids)), lens)
+        pos = np.arange(lens.sum()) - np.repeat(np.cumsum(lens) - lens, lens) + np.repeat(starts, lens)
+        return rows, self.cards[pos]
+
+    def counts(self, ids: np.ndarray, tracked: List[str]) -> np.ndarray:
+        """(rows x tracked cards) copies of each tracked card in each row's deck."""
+        col_of = pd.Series(np.arange(len(tracked)), index=tracked).reindex(self.vocab)
+        col_of = col_of.fillna(-1).astype(int).to_numpy()
+        out = np.zeros((len(ids), len(tracked)), dtype=np.float32)
+        rows, cards = self._tokens(np.asarray(ids))
+        col = col_of[cards]
+        np.add.at(out, (rows[col >= 0], col[col >= 0]), 1.0)
+        return out
+
+    def frequency(self, ids: np.ndarray) -> pd.Series:
+        """How many of these rows' decks contain each card (copies counted)."""
+        _, cards = self._tokens(np.asarray(ids))
+        freq = pd.Series(np.bincount(cards, minlength=len(self.vocab)), index=self.vocab)
+        return freq[freq.index != ""]
+
+    def strings(self, ids: np.ndarray) -> List[str]:
+        return ["|".join(self.vocab[self.cards[self.indptr[i]:self.indptr[i + 1]]]) for i in ids]
+
+
+def load_offers(path: Path, with_decks: bool = False) -> pd.DataFrame:
     """Load only what training needs, in compact types (~6x less memory).
 
     ``offer_id`` and ``group`` become integer codes; they're only used to
-    tell rewards and players apart.
+    tell rewards and players apart. With ``with_decks``, every reward's deck
+    is read from the side file (if there is one) and kept as a
+    :class:`DeckStore` in ``df.attrs["decks"]``, indexed by the ``offer_id`` code.
     """
     df = pd.read_parquet(path, columns=LOAD_COLUMNS)
+    offer_ids = None
     for c in ("offer_id", "group"):
         # sort=True keeps the codes in string order, so row order and the
         # seeded train/test split don't depend on the file's row order.
-        df[c] = pd.factorize(df[c], sort=True)[0].astype("int32")
+        codes, uniques = pd.factorize(df[c], sort=True)
+        df[c] = codes.astype("int32")
+        if c == "offer_id":
+            offer_ids = uniques
     for c in CATEGORICAL_FEATURES + ["source", "relics_held"]:
         df[c] = df[c].astype("string[pyarrow]")
     numeric = [c for c in NUMERIC_FEATURES if c != "is_skip"]  # is_skip stays bool
     df[numeric] = df[numeric].astype("float32")
     df["run_won"] = df["run_won"].astype("boolean")
     # Rows of one reward must be contiguous for the ranker's group sizes.
-    return df.sort_values(["offer_id", "is_skip"], kind="stable").reset_index(drop=True)
+    df = df.sort_values(["offer_id", "is_skip"], kind="stable").reset_index(drop=True)
+    if with_decks and decks_path(path).exists():
+        decks = pd.read_parquet(decks_path(path))
+        by_code = pd.Series(decks["deck_cards"].to_numpy(),
+                            index=pd.Index(offer_ids).get_indexer(decks["offer_id"]))
+        by_code = by_code[by_code.index >= 0]
+        ordered = by_code.reindex(range(len(offer_ids))).fillna("")
+        df.attrs["decks"] = DeckStore(ordered.tolist())
+    return df
 
 
 def split_data(df: pd.DataFrame, cfg: Dict[str, Any]
@@ -96,39 +158,86 @@ def apply_train_filter(df: pd.DataFrame, f: Dict[str, Any]) -> pd.DataFrame:
     return df[keep]
 
 
-def _split_relics(held: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
-    """('A|B', '', 'C') -> relic ids ['A','B','C'] and their row indices [0,0,2]."""
-    lists = pc.split_pattern(pa.array(held.fillna("").astype(str), pa.string()), "|")
+def _split_pipe(values: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
+    """('A|B', '', 'C') -> ids ['A','B','C'] and their row indices [0,0,2]."""
+    lists = pc.split_pattern(pa.array(values.fillna("").astype(str), pa.string()), "|")
     flat = pc.list_flatten(lists).to_numpy(zero_copy_only=False)
     rows = pc.list_parent_indices(lists).to_numpy()
     keep = flat != ""
     return flat[keep], rows[keep]
 
 
-def fit_categories(train: pd.DataFrame) -> Dict[str, List[str]]:
+def _distinct(values: pd.Series) -> Tuple[np.ndarray, pd.Series]:
+    """Row codes into a list of distinct values (deck strings repeat across a
+    reward's rows, so parsing each distinct one once is much cheaper)."""
+    if isinstance(values.dtype, pd.CategoricalDtype):
+        values = values.cat.remove_unused_categories()  # a chunk uses few of the decks
+        return values.cat.codes.to_numpy(), pd.Series(values.cat.categories.astype(str))
+    codes, uniq = pd.factorize(values.fillna("").astype(str))
+    return codes, pd.Series(uniq)
+
+
+def deck_card_counts(decks: pd.Series, tracked: List[str]) -> np.ndarray:
+    """(rows x tracked cards) copies of each tracked card in each row's deck."""
+    codes, uniq = _distinct(decks)
+    ids, rows = _split_pipe(uniq)
+    col = pd.Categorical(ids, categories=tracked).codes
+    per_deck = np.zeros((len(uniq) + 1, len(tracked)), dtype=np.float32)  # last row: missing
+    np.add.at(per_deck, (rows[col >= 0], col[col >= 0]), 1.0)
+    return per_deck[np.where(codes >= 0, codes, len(uniq))]
+
+
+def fit_categories(train: pd.DataFrame, n_deck_cards: int = 0) -> Dict[str, List[str]]:
+    """Categories, the most common relics and (optionally) the ``n_deck_cards``
+    most common deck cards, all from the training rows."""
     cats = {c: sorted(train[c].dropna().unique().tolist()) for c in CATEGORICAL_FEATURES}
-    relics = pd.Series(_split_relics(train["relics_held"])[0]).value_counts()
+    relics = pd.Series(_split_pipe(train["relics_held"])[0]).value_counts()
     cats["relics"] = sorted(relics.head(MAX_RELIC_FEATURES).index.tolist())
+    if n_deck_cards:
+        if "deck_cards" in train:  # deck strings on the rows (small inputs, tests)
+            codes, uniq = _distinct(train["deck_cards"])
+            uses = np.bincount(codes[codes >= 0], minlength=len(uniq))  # rows per deck
+            ids, rows = _split_pipe(uniq)
+            freq = pd.Series(uses[rows]).groupby(ids).sum()
+        else:
+            freq = _deck_store(train).frequency(train["offer_id"].to_numpy())
+        freq = freq.sort_values(ascending=False, kind="stable")
+        cats["deck_cards"] = sorted(freq.head(n_deck_cards).index.tolist())
     return cats
+
+
+def _deck_store(df: pd.DataFrame) -> DeckStore:
+    store = df.attrs.get("decks")
+    if store is None:
+        raise ValueError("this model uses deck cards: pass rows with 'deck_cards', or "
+                         "load offers with load_offers(..., with_decks=True)")
+    return store
 
 
 def to_matrix(df: pd.DataFrame, categories: Dict[str, List[str]]) -> pd.DataFrame:
     """Feature matrix with categories fixed to the training set (unseen -> NaN),
-    plus a 0/1 column per tracked relic."""
+    plus a 0/1 column per tracked relic and, if the model tracks deck cards,
+    a copy count per tracked card (``deck_has_<CARD>``)."""
     X = df[FEATURES].copy()
     for c in NUMERIC_FEATURES:
         X[c] = X[c].astype("float32")
     for c in CATEGORICAL_FEATURES:
         X[c] = pd.Categorical(X[c], categories=categories[c])
+    extra = []
     tracked = categories.get("relics", [])
     if tracked:
-        ids, rows = _split_relics(df["relics_held"])
+        ids, rows = _split_pipe(df["relics_held"])
         col = pd.Categorical(ids, categories=tracked).codes
         flags = np.zeros((len(df), len(tracked)), dtype=np.float32)
         flags[rows[col >= 0], col[col >= 0]] = 1.0
-        X = pd.concat([X, pd.DataFrame(flags, index=X.index,
-                                       columns=[f"relic_{r}" for r in tracked])], axis=1)
-    return X
+        extra.append(pd.DataFrame(flags, index=X.index, columns=[f"relic_{r}" for r in tracked]))
+    cards = categories.get("deck_cards", [])
+    if cards:
+        counts = (deck_card_counts(df["deck_cards"], cards) if "deck_cards" in df
+                  else _deck_store(df).counts(df["offer_id"].to_numpy(), cards))
+        extra.append(pd.DataFrame(counts, index=X.index,
+                                  columns=[f"deck_has_{c}" for c in cards]))
+    return pd.concat([X, *extra], axis=1) if extra else X
 
 
 def group_sizes(df: pd.DataFrame) -> np.ndarray:
@@ -224,9 +333,14 @@ def train_ranker(train: pd.DataFrame, valid: pd.DataFrame, cfg: Dict[str, Any]
 
 def predict(booster: lgb.Booster, categories: Dict[str, List[str]],
             df: pd.DataFrame) -> np.ndarray:
-    # Select the booster's own columns so models trained on fewer features still work.
-    X = to_matrix(df, categories)[booster.feature_name()]
-    return booster.predict(X, num_iteration=booster.best_iteration)
+    # Select the booster's own columns so models trained on fewer features still
+    # work; score in chunks so wide feature matrices don't all sit in memory.
+    names = booster.feature_name()
+    chunk = 500_000
+    out = [booster.predict(to_matrix(df.iloc[i:i + chunk], categories)[names],
+                           num_iteration=booster.best_iteration)
+           for i in range(0, len(df), chunk)]
+    return np.concatenate(out) if out else np.zeros(0)
 
 
 def save_model(booster: lgb.Booster, categories: Dict[str, List[str]],
@@ -294,7 +408,7 @@ def run(cfg: Dict[str, Any], compare_with: Optional[Path] = None) -> Dict[str, A
             against=str(compare_with))
     gain = booster.feature_importance("gain")
     metrics["feature_importance"] = dict(sorted(
-        zip(booster.feature_name(), (gain / gain.sum()).round(4).tolist()),
+        zip(booster.feature_name(), (gain / max(gain.sum(), 1e-12)).round(4).tolist()),
         key=lambda kv: -kv[1]))
 
     save_model(booster, categories, metrics, Path(cfg["output"]["model_dir"]))

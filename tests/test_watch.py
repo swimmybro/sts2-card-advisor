@@ -74,7 +74,9 @@ def test_review_run(tmp_path, advisor):
 
     text = format_review(review)
     assert text.startswith("Run 42: IRONCLAD A3, lost to QUEEN_BOSS after 4 floors")
-    assert "you: ANGER" in text and "Agreed with the pick model on" in text
+    assert "you: ANGER" in text and "best:" in text and "popular:" in text
+    assert "Took the best option (ties count) on" in text
+    assert text.index("Took the best option") < text.index("Took the popular option")
 
 
 def test_review_coop_and_abandoned(tmp_path, advisor):

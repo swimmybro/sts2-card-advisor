@@ -67,6 +67,16 @@ OFFER_SCHEMA = pa.schema([
     ("picked", pa.bool_()), ("run_won", pa.bool_()), ("floors_reached", pa.int64()),
 ])
 OFFER_COLUMNS = OFFER_SCHEMA.names
+# The deck before each pick, stored once per reward in a side file (repeating it
+# on every option's row made the table far too big to load): '|'-separated,
+# repeats = copies. Rows from reward_rows() also carry it as ``deck_cards``.
+DECK_SCHEMA = pa.schema([("offer_id", pa.string()), ("deck_cards", pa.string())])
+
+
+def decks_path(offers_path: Path) -> Path:
+    """offers.parquet -> offers_decks.parquet"""
+    offers_path = Path(offers_path)
+    return offers_path.with_name(offers_path.stem + "_decks.parquet")
 
 
 class RunRejected(ValueError):
@@ -168,6 +178,7 @@ def reward_rows(base: Dict[str, Any], candidates: List[Dict[str, Any]],
     hp, max_hp = base.get("hp"), base.get("max_hp")
     base = dict(base, n_offered=len(candidates),
                 hp_frac=hp / max_hp if hp is not None and max_hp else None,
+                deck_cards=deck_string(deck),
                 **_deck_features(deck, meta))
     rows = []
     for c in candidates:
@@ -189,6 +200,11 @@ def reward_rows(base: Dict[str, Any], candidates: List[Dict[str, Any]],
         picked=not any(c.get("picked") for c in candidates),
     ))
     return rows
+
+
+def deck_string(deck: Counter) -> str:
+    """Counter({'B': 2, 'A': 1}) -> 'A|B|B' (sorted; repeats = copies)."""
+    return "|".join(card for card in sorted(deck) for _ in range(deck[card]) if card)
 
 
 def relic_fields(relic_ids: Iterable[str]) -> Dict[str, Any]:
@@ -271,11 +287,21 @@ def offer_rows(data: Dict[str, Any], run_id: str, source: str,
 def build_offers(paths: Iterable[Path], out: Path, meta: Dict[str, dict],
                  allowed_cards: Optional[Set[str]] = None,
                  chunk_runs: int = 5000) -> FeatureStats:
-    """Stream offer rows for every kept solo run into ``out`` (Parquet)."""
+    """Stream offer rows for every kept solo run into ``out`` (Parquet), and each
+    reward's deck into :func:`decks_path` ``(out)``."""
     stats = FeatureStats(parse=ParseStats())
     out.parent.mkdir(parents=True, exist_ok=True)
     buf: List[dict] = []
-    with pq.ParquetWriter(out, OFFER_SCHEMA) as writer:
+
+    def flush() -> None:
+        writer.write_table(pa.Table.from_pylist(buf, schema=OFFER_SCHEMA))
+        deck_writer.write_table(pa.Table.from_pylist(
+            [{"offer_id": r["offer_id"], "deck_cards": r["deck_cards"]}
+             for r in buf if r["is_skip"]], schema=DECK_SCHEMA))  # one row per reward
+        buf.clear()
+
+    with pq.ParquetWriter(out, OFFER_SCHEMA) as writer, \
+            pq.ParquetWriter(decks_path(out), DECK_SCHEMA) as deck_writer:
         for run_id, source, data, _, _ in iter_kept_runs(
                 paths, stats.parse, include_multiplayer=False,
                 allowed_cards=allowed_cards):
@@ -292,10 +318,9 @@ def build_offers(paths: Iterable[Path], out: Path, meta: Dict[str, dict],
             stats.n_offers += sum(r["is_skip"] for r in rows)
             buf.extend(rows)
             if stats.n_runs % chunk_runs == 0:
-                writer.write_table(pa.Table.from_pylist(buf, schema=OFFER_SCHEMA))
-                buf.clear()
+                flush()
                 log.info("built %d runs", stats.n_runs)
-        writer.write_table(pa.Table.from_pylist(buf, schema=OFFER_SCHEMA))
+        flush()
     return stats
 
 

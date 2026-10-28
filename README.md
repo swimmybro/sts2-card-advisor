@@ -120,7 +120,7 @@ The pick model copies what players choose. The win model instead ranks options b
 PYTHONPATH=src .venv/bin/python -m sts2_advisor.win --config configs/win.yaml --pick-model models/card_pick
 ```
 
-- **Training data:** the option each player actually picked at each reward, labelled with whether the run was won. Abandoned runs are left out. It uses the same features as the pick model: the state before the pick plus the picked option's details.
+- **Training data:** the option each player actually picked at each reward, labelled with whether the run was won. Abandoned runs are left out. It uses the pick model's features (the state before the pick plus the picked option's details), plus the deck's actual cards: one copy-count column (`deck_has_<CARD>`) for each of the 250 most common cards in training decks (`features.deck_cards` in `configs/win.yaml`). Those columns let it learn card synergies, such as a card winning more often when the deck already holds a particular other card.
 - **Ranking a reward:** every option, including `SKIP`, is scored with the same model ("if you take this, how likely is a win?").
 - **Same test sets:** [`configs/win.yaml`](configs/win.yaml) uses the same split as `train.yaml`.
 - **Report:**
@@ -128,6 +128,7 @@ PYTHONPATH=src .venv/bin/python -m sts2_advisor.win --config configs/win.yaml --
   - how often its top option matches the player's pick and the pick model's
   - how often it suggests skipping, and how big the gap is between a reward's best and worst options
   - which cards it favours more or less than players do
+  - **deck sensitivity:** test rewards are scored again with a different real deck from a reward of the same character and act, keeping everything else the same. It reports how often the top option changes, and how much the options' win chances move relative to each other. A model that ignores the deck scores near zero.
 - **Output:** saved to `models/win_prob/` and logged to MLflow under the `win-prob` experiment.
 
 It learns from outcomes, but it's still correlational. Stronger players both win more and pick differently, so a card can look good partly because good players take it.
@@ -150,10 +151,12 @@ Serve the trained model over HTTP:
 .venv/bin/uvicorn --factory sts2_advisor.serve:create_app --app-dir src --port 8000
 ```
 
-`MODEL_DIR` (default `models/card_pick`) and `CARD_META` (default `configs/cards.csv`) choose the pick model and card list. `WIN_MODEL_DIR` (default `models/win_prob`) points to the optional win model. If it exists, each option also gets a `win_chance`, and the response gets a `win_suggestion`. If the win model was trained with `--pick-model`, the reliability check is applied:
+`MODEL_DIR` (default `models/card_pick`) and `CARD_META` (default `configs/cards.csv`) choose the pick model and card list. `WIN_MODEL_DIR` (default `models/win_prob`) points to the win model, which drives the recommendation. Without it, the API falls back to the pick model. If the win model was trained with `--pick-model`, the reliability check is applied:
 - each option also gets `pick_chance`, `raw_win_chance` (before the adjustment) and `low_confidence`
 - `win_chance` is the adjusted value
-- `win_tied` lists the options tied for best, and is empty when one option is clearly best Interactive docs are at http://127.0.0.1:8000/docs.
+- `win_tied` lists the options tied for best, and is empty when one option is clearly best
+
+Interactive docs are at http://127.0.0.1:8000/docs.
 
 - `GET /health`: confirms the server is up and shows which model is loaded.
 - `POST /rank`: send the current state and the offered cards; get them back ranked, plus `SKIP`:
@@ -170,7 +173,11 @@ curl -s -X POST http://127.0.0.1:8000/rank -H 'Content-Type: application/json' -
 
 Card names are forgiving: `"Shrug It Off"`, `"shrug_it_off"` and `"CARD.SHRUG_IT_OFF"` all work, and a trailing `+` marks an upgraded card. `deck` is the deck *before* the pick, and `relics` is every relic you hold. Features are computed with the same code as the training data (`features.reward_rows`).
 
-The response's `suggestion` is the top-ranked option. `ranking` lists every option with its model score; higher is better, and scores are only meaningful relative to each other. Cards the model never saw in training, often typos, get `known: false` and are listed in `unknown_cards`. Treat their scores with suspicion.
+The response:
+- **`suggestion`:** the option with the highest win chance. `suggestion_source` says `win_model`, or `pick_model` when no win model is loaded.
+- **`popular_choice`:** what players most often take in this spot, from the pick model.
+- **`ranking`:** every option, best first by win chance, with its `win_chance` and its pick-model `score` (higher means players take it more; only meaningful relative to the other options).
+- **Unknown cards:** cards the models never saw in training, often typos, get `known: false` and are listed in `unknown_cards`. Treat their numbers with suspicion.
 
 ### Running in Docker
 
@@ -206,10 +213,10 @@ PYTHONPATH=src .venv/bin/python -m sts2_advisor.watch
 For each solo run, the review lists every card reward with:
 - the options offered
 - your pick
-- the pick model's top option
-- the win model's top option ("tie" when you picked one of several equally good options), with the win chance of your pick against the best
+- the best option by win chance ("tie" when you picked one of several equally good options), with the win chance of your pick against the best
+- the popular option (what players most often take)
 
-It ends with how often you agreed with each model, and the rewards where the win model most preferred a different option. Co-op runs are copied but not reviewed.
+It ends with how often you took the best and the popular option, and the rewards where the best option's win chance most exceeded your pick's. Co-op runs are copied but not reviewed.
 
 Your own runs are held out from training, so the models are judging picks they haven't seen. Scoring uses the same code as the API ([`advise.py`](src/sts2_advisor/advise.py)).
 
@@ -244,6 +251,23 @@ Recent runs are compared like with like. Community runs are compared with the co
 Thresholds are in [`configs/monitor.yaml`](configs/monitor.yaml). The report ends with a verdict: "models look fine", "retrain recommended" (with reasons), or "too little recent data". `--json FILE` saves the full result, and `--fail-on-drift` exits with status 1 on drift, for scheduled jobs.
 
 The win model's chances are calibrated to community players. For a player who wins less often than average, they run high: on the author's runs, it predicts 37% against an actual 15%. That's stable rather than drift, and the ranking still works (AUC 0.79).
+
+## Retraining in one command
+
+When the monitor recommends retraining (after downloading a new export into `data/external/`):
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.pipeline
+```
+
+1. **Features:** rebuilds `data/processed/offers.parquet` from `data/raw` and `data/external`. `--skip-features` reuses the existing file.
+2. **Training:** trains a new pick model and win model into `models/staging/`, using `configs/train.yaml` and `configs/win.yaml`.
+3. **Comparison:** scores the new and the current models (`models/card_pick`, `models/win_prob`) on the same test set: pick-model top-1 on community runs and on your runs, plus win-model AUC and log loss.
+4. **Promotion:** if neither new model is worse beyond the tolerance in [`configs/pipeline.yaml`](configs/pipeline.yaml), the current pair moves to `models/archive/<time>/` and the new pair takes its place. The models are promoted or kept together, so the win model's reliability settings always match the pick model beside it. If the new models are worse, they stay in `models/staging/` for inspection. `--force` promotes them regardless.
+
+To restore an archived pair, move its `card_pick` and `win_prob` folders back into `models/`.
+
+If the data has changed, the current models may have trained on some runs that are now in the test set. That slightly favours keeping the current models, which is the safe direction.
 
 ## Tests
 

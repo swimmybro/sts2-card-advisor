@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from sts2_advisor.features import DEFAULT_CARD_META, TRAIT_COLUMNS, load_card_meta
 from sts2_advisor.train import (
     CATEGORICAL_FEATURES, fit_categories, load_model, load_offers, log_to_mlflow,
     predict, save_model, split_data, to_matrix, top_picks,
@@ -101,7 +102,7 @@ def train_win_model(train: pd.DataFrame, valid: pd.DataFrame, cfg: Dict[str, Any
     early = m.pop("early_stopping_rounds")
     params = dict(m, verbose=-1, seed=cfg["split"]["seed"])
     tr, va = outcome_rows(train), outcome_rows(valid)
-    categories = fit_categories(tr)
+    categories = fit_categories(tr, n_deck_cards=(cfg.get("features") or {}).get("deck_cards", 0))
     dtrain = lgb.Dataset(to_matrix(tr, categories), label=tr["run_won"].astype(int),
                          categorical_feature=CATEGORICAL_FEATURES)
     dvalid = lgb.Dataset(to_matrix(va, categories), label=va["run_won"].astype(int),
@@ -205,8 +206,72 @@ def reliability_metrics(df: pd.DataFrame, win_scores: np.ndarray, pick_scores: n
 
 # ------------------------------------------------------------------------- main
 
-def run(cfg: Dict[str, Any], pick_model: Optional[Path] = None) -> Dict[str, Any]:
-    parts = split_data(load_offers(Path(cfg["data"]["offers"])), cfg)
+DECK_COLUMNS = ["deck_size", "deck_attacks", "deck_skills", "deck_powers", "deck_curses",
+                "deck_basics", "deck_avg_cost", *TRAIT_COLUMNS.values()]
+
+
+def deck_sensitivity(df: pd.DataFrame, booster: lgb.Booster, categories: Dict[str, List[str]],
+                     meta: Dict[str, dict], n: int = 20000, seed: int = 0) -> Dict[str, float]:
+    """How much the model's advice depends on the deck.
+
+    For a sample of rewards, swap in the deck from another reward of the same
+    character and act (keeping everything else: the offered cards, HP, relics,
+    floor) and score again. Reports how often the top option changes, and how
+    much each option's win chance moves *relative to the reward's average*
+    (so a deck that's simply stronger overall doesn't count).
+    """
+    rng = np.random.default_rng(seed)
+    offers = df[df["is_skip"].to_numpy()].drop_duplicates("offer_id")
+    if len(offers) < 2 or ("deck_cards" not in df and df.attrs.get("decks") is None):
+        return {"n_rewards": 0, "top_pick_changed": float("nan"),
+                "mean_relative_change": float("nan")}
+    sample = offers.sample(min(n, len(offers)), random_state=seed)
+    donor = {}
+    for _, ids in offers.groupby(["character", "act"], observed=True)["offer_id"]:
+        ids = ids.to_numpy()
+        if len(ids) > 1:  # pair every reward with another one from the same group
+            donor.update(zip(ids, np.roll(rng.permutation(ids), 1)))
+    picked = [o for o in sample["offer_id"] if o in donor]
+    rows = df[df["offer_id"].isin(picked)].copy()
+    donors = rows["offer_id"].map(donor).to_numpy()
+    if "deck_cards" in df:  # deck strings on the rows
+        deck_of = offers.set_index("offer_id")["deck_cards"].astype(str)
+        rows["deck_cards"] = rows["deck_cards"].astype(str)
+        donor_decks = deck_of.loc[donors].to_numpy()
+    else:  # decks held in the DeckStore (only the sampled ones are turned into text)
+        store = df.attrs["decks"]
+        rows["deck_cards"] = store.strings(rows["offer_id"].to_numpy())
+        donor_decks = store.strings(donors)
+    source = offers.set_index("offer_id").loc[donors]
+    swapped = rows.copy()
+    swapped[DECK_COLUMNS] = source[DECK_COLUMNS].to_numpy()
+    swapped["deck_cards"] = donor_decks
+    decks = [d.split("|") if d else [] for d in swapped["deck_cards"]]
+    cards = swapped["candidate"].to_numpy()
+    is_skip = swapped["is_skip"].to_numpy()
+    swapped["cand_copies_in_deck"] = [np.nan if s else deck.count(c)
+                                      for c, deck, s in zip(cards, decks, is_skip)]
+    swapped["cand_synergy"] = [
+        np.nan if s else sum(row[TRAIT_COLUMNS[t]] for t in meta.get(c, {}).get("traits", ()))
+        for c, s, (_, row) in zip(cards, is_skip, swapped[list(TRAIT_COLUMNS.values())].iterrows())]
+
+    ids = rows["offer_id"].to_numpy()
+    before, after = predict(booster, categories, rows), predict(booster, categories, swapped)
+
+    def relative(p):
+        s = pd.Series(p)
+        return (s - s.groupby(ids).transform("mean")).to_numpy()
+
+    top_before = pd.Series(before).groupby(ids).idxmax().to_numpy()
+    top_after = pd.Series(after).groupby(ids).idxmax().to_numpy()
+    return {"n_rewards": int(len(picked)),
+            "top_pick_changed": float((top_before != top_after).mean()),
+            "mean_relative_change": float(np.abs(relative(after) - relative(before)).mean())}
+
+
+def run(cfg: Dict[str, Any], pick_model: Optional[Path] = None,
+        card_meta: Path = DEFAULT_CARD_META) -> Dict[str, Any]:
+    parts = split_data(load_offers(Path(cfg["data"]["offers"]), with_decks=True), cfg)
     booster, categories = train_win_model(parts["train"], parts["valid"], cfg)
     metrics: Dict[str, Any] = {
         "best_iteration": booster.best_iteration,
@@ -226,6 +291,9 @@ def run(cfg: Dict[str, Any], pick_model: Optional[Path] = None) -> Dict[str, Any
             continue
         win_scores = predict(booster, categories, d)
         pick_scores = predict(*pick, d) if pick else None
+        if split == "test":
+            metrics["deck_sensitivity"] = deck_sensitivity(
+                d, booster, categories, load_card_meta(card_meta), seed=cfg["split"]["seed"])
         metrics[split] = {"outcome": outcome_metrics(d, booster, categories),
                           "ranking": ranking_metrics(d, win_scores, pick_scores)}
         if reliability:
@@ -233,7 +301,7 @@ def run(cfg: Dict[str, Any], pick_model: Optional[Path] = None) -> Dict[str, Any
                 d, win_scores, pick_scores, reliability)
     gain = booster.feature_importance("gain")
     metrics["feature_importance"] = dict(sorted(
-        zip(booster.feature_name(), (gain / gain.sum()).round(4).tolist()),
+        zip(booster.feature_name(), (gain / max(gain.sum(), 1e-12)).round(4).tolist()),
         key=lambda kv: -kv[1]))
 
     model_dir = Path(cfg["output"]["model_dir"])
@@ -302,6 +370,12 @@ def report(metrics: Dict[str, Any]) -> str:
                               f"{k} (+{v:.1%})" for k, v in a["favoured_over_players"].items()),
                           "    Less than players: " + ", ".join(
                               f"{k} ({v:.1%})" for k, v in a["less_than_players"].items())]
+    s = metrics.get("deck_sensitivity")
+    if s and s["n_rewards"]:
+        lines += ["", f"Deck sensitivity ({s['n_rewards']} test rewards, each scored again with "
+                      "another real deck of the same character and act):",
+                  f"  Top option changes in {s['top_pick_changed']:.1%} of rewards; options' win "
+                  f"chances move {s['mean_relative_change']:.2%} on average relative to each other"]
     lines += ["", "Top features (share of gain):"]
     for name, share in list(metrics["feature_importance"].items())[:10]:
         lines.append(f"  {name:<22} {share:6.1%}")

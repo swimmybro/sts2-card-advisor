@@ -95,14 +95,17 @@ class RankedCard(BaseModel):
 
 
 class RankResponse(BaseModel):
-    suggestion: str = Field(description="Top option by the pick model")
-    win_suggestion: Optional[str] = Field(
-        None, description="Top option by win chance (if a win model is loaded)")
+    suggestion: str = Field(
+        description="The recommended option: highest win chance (or, without a win "
+                    "model, what players most often take)")
+    suggestion_source: Literal["win_model", "pick_model"]
+    popular_choice: str = Field(description="What players most often take here (pick model)")
     win_tied: List[str] = Field(
         default_factory=list,
         description="Options whose win chance is within the tie margin of the best; "
                     "empty unless two or more are effectively tied")
-    ranking: List[RankedCard]
+    ranking: List[RankedCard] = Field(
+        description="All options, best first (by win chance when a win model is loaded)")
     unknown_cards: List[str]
 
 
@@ -134,7 +137,8 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
         rows = pd.DataFrame(reward_rows(base, candidates, deck, advisor.meta)).assign(offer_id=0)
         rows = advisor.score(rows)
         tied = rows[rows["tied"]].sort_values("win", ascending=False)["candidate"].tolist()
-        rows = rows.sort_values("score", ascending=False)
+        popular = rows.loc[rows["score"].idxmax(), "candidate"]
+        rows = rows.sort_values("win" if advisor.win else "score", ascending=False)
 
         def num(v):
             return None if np.isnan(v) else round(float(v), 4)
@@ -150,7 +154,8 @@ def create_app(model_dir: Optional[Path] = None, card_meta: Optional[Path] = Non
         ]
         return RankResponse(
             suggestion=ranking[0].card,
-            win_suggestion=(rows.loc[rows["win"].idxmax(), "candidate"] if advisor.win else None),
+            suggestion_source="win_model" if advisor.win else "pick_model",
+            popular_choice=popular,
             win_tied=tied,
             ranking=ranking,
             unknown_cards=sorted({c["id"] for c in candidates} - advisor.known_cards),

@@ -1,0 +1,17 @@
+# One-command retrain (python -m sts2_advisor.pipeline --config configs/pipeline.yaml)
+
+inputs: [data/raw, data/external]      # your runs first, so duplicates keep your copy
+offers: data/processed/offers.parquet
+train_config: configs/train.yaml       # pick model settings (and the shared test split)
+win_config: configs/win.yaml
+
+models:
+  current: models                      # card_pick/ and win_prob/ in use (API, watcher)
+  staging: models/staging              # where new models are trained
+  archive: models/archive              # replaced models, one folder per promotion
+
+# The new pair replaces the current pair only if neither model is worse than
+# this on the same test set.
+tolerance:
+  pick_top1: 0.002
+  win_auc: 0.003

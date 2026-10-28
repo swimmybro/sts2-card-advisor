@@ -51,18 +51,22 @@ def test_health(client):
 
 def test_no_win_model_means_no_win_fields(client):
     body = client.post("/rank", json=state()).json()
-    assert body["win_suggestion"] is None
+    # without a win model, the pick model's top option is the suggestion
+    assert body["suggestion_source"] == "pick_model"
+    assert body["suggestion"] == body["popular_choice"]
     assert all(r["win_chance"] is None for r in body["ranking"])
 
 
-def test_win_chance_per_option(win_client):
+def test_win_model_drives_the_suggestion(win_client):
     assert win_client.get("/health").json()["win_model_dir"].endswith("win")
     body = win_client.post("/rank", json=state()).json()
-    chances = {r["card"]: r["win_chance"] for r in body["ranking"]}
-    assert set(chances) == {"GOOD", "A", "B", "SKIP"}
-    assert all(0.0 <= c <= 1.0 for c in chances.values())
-    assert body["win_suggestion"] == max(chances, key=chances.get)
-    assert body["suggestion"] == "GOOD"  # pick-model suggestion unchanged
+    chances = [r["win_chance"] for r in body["ranking"]]
+    assert {r["card"] for r in body["ranking"]} == {"GOOD", "A", "B", "SKIP"}
+    assert all(0.0 <= c <= 1.0 for c in chances)
+    assert chances == sorted(chances, reverse=True)  # ranked by win chance
+    assert body["suggestion_source"] == "win_model"
+    assert body["suggestion"] == body["ranking"][0]["card"]
+    assert body["popular_choice"] == "GOOD"  # what players take, from the pick model
 
 
 def test_reliability_fields(win_client):
@@ -76,7 +80,7 @@ def test_reliability_fields(win_client):
     assert ranking["GOOD"]["low_confidence"] is False
     assert isinstance(body["win_tied"], list)
     if body["win_tied"]:
-        assert body["win_suggestion"] == body["win_tied"][0] and len(body["win_tied"]) > 1
+        assert body["suggestion"] == body["win_tied"][0] and len(body["win_tied"]) > 1
 
 
 def test_rank_suggests_learned_pick(client):

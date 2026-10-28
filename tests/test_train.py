@@ -5,10 +5,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from sts2_advisor.features import OFFER_COLUMNS, SKIP
+from sts2_advisor.features import OFFER_COLUMNS, SKIP, decks_path
 from sts2_advisor.train import (
-    apply_train_filter, compare_top_picks, evaluate, fit_categories, main,
-    pick_rate_scores, predict, run, split_data, to_matrix,
+    DeckStore, apply_train_filter, compare_top_picks, evaluate, fit_categories, load_offers,
+    main, pick_rate_scores, predict, run, split_data, to_matrix,
 )
 
 
@@ -71,6 +71,59 @@ def test_relic_columns_capped(monkeypatch):
     train = pd.DataFrame(sum((rows(f"{i}:1", ["X"], "X", relics_held=h)
                               for i, h in enumerate(held)), []))
     assert fit_categories(train)["relics"] == ["A", "B"]
+
+
+def test_deck_card_columns():
+    train = pd.DataFrame(rows("a:1", ["X", SKIP], "X", deck_cards="A|A|B")
+                         + rows("b:1", ["X", SKIP], "X", deck_cards="A|C")
+                         + rows("c:1", ["X", SKIP], "X", deck_cards=""))
+    assert "deck_cards" not in fit_categories(train)  # off unless asked for
+    cats = fit_categories(train, n_deck_cards=2)
+    assert cats["deck_cards"] == ["A", "B"]  # A in 4 rows, B and C in 2; ties by name
+    X = to_matrix(train, cats)
+    assert X[["deck_has_A", "deck_has_B"]].values.tolist() == [[2, 1], [2, 1], [1, 0],
+                                                                [1, 0], [0, 0], [0, 0]]
+    # dictionary-encoded input (as load_offers(with_decks=True) gives) works the same
+    as_cat = train.assign(deck_cards=train["deck_cards"].astype("category"))
+    assert to_matrix(as_cat.iloc[2:4], cats)[["deck_has_A"]].values.tolist() == [[1], [1]]
+
+
+def test_deck_store():
+    store = DeckStore(["A|A|B", "", "C|B"])
+    assert store.counts(np.array([0, 1, 2, 0]), ["A", "B"]).tolist() == [
+        [2, 1], [0, 0], [0, 1], [2, 1]]
+    assert store.frequency(np.array([0, 2])).to_dict() == {"A": 2, "B": 2, "C": 1}
+    assert store.strings([2, 1]) == ["C|B", ""]
+
+
+def test_load_offers_with_deck_side_file(tmp_path):
+    df = synthetic_offers(n_runs=40)
+    df.to_parquet(tmp_path / "offers.parquet")
+    offer_ids = df.loc[df["is_skip"], "offer_id"]
+    decks = pd.DataFrame({"offer_id": offer_ids,
+                          "deck_cards": ["A|B" if i % 2 else "B" for i in range(len(offer_ids))]})
+    decks.to_parquet(decks_path(tmp_path / "offers.parquet"))
+
+    assert "decks" not in load_offers(tmp_path / "offers.parquet").attrs
+    loaded = load_offers(tmp_path / "offers.parquet", with_decks=True)
+    parts = split_data(loaded, config(tmp_path))
+    for name in ("train", "test", "mine"):
+        assert parts[name].attrs["decks"] is loaded.attrs["decks"]  # survives splitting
+
+    cats = fit_categories(parts["train"], n_deck_cards=2)
+    assert cats["deck_cards"] == ["A", "B"]
+    from_store = to_matrix(parts["test"], cats)[["deck_has_A", "deck_has_B"]]
+    # the same rows with deck strings attached give the same columns
+    strings = dict(zip(decks["offer_id"], decks["deck_cards"]))
+    original_ids = pd.Series(sorted(offer_ids)).to_numpy()[parts["test"]["offer_id"]]
+    as_text = parts["test"].assign(deck_cards=[strings[o] for o in original_ids])
+    assert (to_matrix(as_text, cats)[from_store.columns].values == from_store.values).all()
+
+
+def test_deck_columns_need_decks(tmp_path):
+    rows_without = pd.DataFrame(rows("a:1", ["X", SKIP], "X"))
+    with pytest.raises(ValueError, match="uses deck cards"):
+        to_matrix(rows_without, {**fit_categories(rows_without), "deck_cards": ["A"]})
 
 
 def test_compare_top_picks():

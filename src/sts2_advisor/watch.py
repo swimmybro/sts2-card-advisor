@@ -163,17 +163,21 @@ def format_review(review: RunReview, n_worst: int = 3) -> str:
     has_win = "win_top" in r
     lines = [head, ""]
     for x in r.itertuples():
-        line = (f"  F{x.floor:<3} {x.room:<8} {', '.join(x.offered):<44} "
-                f"you: {x.yours:<16} pick model: {x.pick_top:<16}")
+        line = f"  F{x.floor:<3} {x.room:<8} {', '.join(x.offered):<44} you: {x.yours:<16}"
         if has_win:
-            win = "tie" if len(x.tied) > 1 and x.agrees_win else x.win_top
+            best = "tie" if len(x.tied) > 1 and x.agrees_win else x.win_top
             flag = " (low confidence)" if x.best_low_confidence and not x.agrees_win else ""
-            line += f" win model: {win:<16} {x.your_win:5.1%} vs best {x.best_win:5.1%}{flag}"
+            line += (f" best: {best:<16} win {x.your_win:5.1%} vs {x.best_win:5.1%}{flag}"
+                     f"   popular: {x.pick_top}")
+        else:
+            line += f" popular: {x.pick_top}"
         lines.append(line.rstrip())
     n = len(r)
-    lines += ["", f"  Agreed with the pick model on {int(r['agrees_pick'].sum())}/{n} rewards"]
+    lines.append("")
     if has_win:
-        lines.append(f"  Agreed with the win model (ties count) on {int(r['agrees_win'].sum())}/{n}")
+        lines.append(f"  Took the best option (ties count) on {int(r['agrees_win'].sum())}/{n} rewards")
+    lines.append(f"  Took the popular option on {int(r['agrees_pick'].sum())}/{n}")
+    if has_win:
         worst = r[r["gap"] > 0].sort_values("gap", ascending=False).head(n_worst)
         if len(worst):
             lines.append("  Biggest win-chance differences from the win model's choice:")
