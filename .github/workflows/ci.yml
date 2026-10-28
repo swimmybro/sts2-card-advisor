@@ -73,8 +73,8 @@ jobs:
             "offered": ["Good", "A", "B"]}' | python -c "
           import json, sys
           b = json.load(sys.stdin)
-          assert b['suggestion_source'] == 'win_model', b
-          assert b['popular_choice'] == 'GOOD', b
+          assert b['suggestion_source'] in ('win_model', 'win_tie_popular'), b
+          assert b['popular_choice'] == 'GOOD' and b['suggestion'] == 'GOOD', b
           assert all(r['win_chance'] is not None for r in b['ranking']), b
           print('rank ok:', b['suggestion'], 'popular:', b['popular_choice'])"
 
