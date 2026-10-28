@@ -40,8 +40,25 @@ EVAL_SPLITS = {"test": "Community test set",
 
 # --------------------------------------------------------------------------- data
 
+LOAD_COLUMNS = FEATURES + ["offer_id", "group", "source", "picked", "run_won"]
+
+
 def load_offers(path: Path) -> pd.DataFrame:
-    df = pd.read_parquet(path)
+    """Load only what training needs, in compact types (~6x less memory).
+
+    ``offer_id`` and ``group`` become integer codes; they're only used to
+    tell rewards and players apart.
+    """
+    df = pd.read_parquet(path, columns=LOAD_COLUMNS)
+    for c in ("offer_id", "group"):
+        # sort=True keeps the codes in string order, so row order and the
+        # seeded train/test split don't depend on the file's row order.
+        df[c] = pd.factorize(df[c], sort=True)[0].astype("int32")
+    for c in CATEGORICAL_FEATURES + ["source"]:
+        df[c] = df[c].astype("string[pyarrow]")
+    numeric = [c for c in NUMERIC_FEATURES if c != "is_skip"]  # is_skip stays bool
+    df[numeric] = df[numeric].astype("float32")
+    df["run_won"] = df["run_won"].astype("boolean")
     # Rows of one reward must be contiguous for the ranker's group sizes.
     return df.sort_values(["offer_id", "is_skip"], kind="stable").reset_index(drop=True)
 
@@ -81,7 +98,7 @@ def to_matrix(df: pd.DataFrame, categories: Dict[str, List[str]]) -> pd.DataFram
     """Feature matrix with categories fixed to the training set (unseen -> NaN)."""
     X = df[FEATURES].copy()
     for c in NUMERIC_FEATURES:
-        X[c] = X[c].astype("float64")
+        X[c] = X[c].astype("float32")
     for c in CATEGORICAL_FEATURES:
         X[c] = pd.Categorical(X[c], categories=categories[c])
     return X
@@ -216,6 +233,7 @@ def compare_top_picks(df: pd.DataFrame, ours: np.ndarray, theirs: np.ndarray,
 def run(cfg: Dict[str, Any], compare_with: Optional[Path] = None) -> Dict[str, Any]:
     df = load_offers(Path(cfg["data"]["offers"]))
     parts = split_data(df, cfg)
+    del df  # the splits hold their own copies
     parts["test_won"] = parts["test"][parts["test"]["run_won"].fillna(False).astype(bool)]
     train, valid = parts["train"], parts["valid"]
     log.info("offers: %s", {k: v["offer_id"].nunique() for k, v in parts.items()})
