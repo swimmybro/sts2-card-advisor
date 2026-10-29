@@ -115,9 +115,16 @@ class Advisor:
 
 
 def normalize_id(name: str, prefix: str) -> str:
-    """'Burning Blood' / 'RELIC.BURNING_BLOOD' -> 'BURNING_BLOOD' (prefix='relic')."""
+    """In-game name or id -> id, the way the game forms ids: apostrophes and
+    '!' / '.' dropped; spaces, hyphens and commas become '_'.
+
+    'Burning Blood' -> 'BURNING_BLOOD', "Ascender's Bane" -> 'ASCENDERS_BANE',
+    'Fight Me!' -> 'FIGHT_ME', 'Flick-Flack' -> 'FLICK_FLACK',
+    'RELIC.BURNING_BLOOD' -> 'BURNING_BLOOD' (with prefix='relic').
+    """
     name = re.sub(rf"^{prefix}\.", "", name.strip(), flags=re.IGNORECASE)
-    return re.sub(r"[\s']+", "_", name).upper()
+    name = re.sub(r"['’!.]", "", name)
+    return re.sub(r"[\s,\-_]+", "_", name).strip("_").upper()
 
 
 def normalize_card(name: str) -> Tuple[str, bool]:

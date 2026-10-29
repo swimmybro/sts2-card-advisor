@@ -1,0 +1,6 @@
+-r requirements.txt
+# macOS only: read the offered cards off the screen (pick --screen / --auto).
+pyobjc-framework-Vision>=10.0
+pyobjc-framework-Quartz>=10.0
+# Only for the screen-reading tests (they draw a mock reward screen).
+pillow>=10.0

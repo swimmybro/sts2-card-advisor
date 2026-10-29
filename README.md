@@ -19,7 +19,7 @@ The trained models live in `models/` and aren't in git. Build them with [Retrain
 
 Run these from the project folder.
 
-**1. At a card reward (during a run):** type the offered cards, with a trailing `+` for upgraded ones; add `--elite` or `--boss` after those fights. Everything else comes from the game's save of your run in progress.
+**1. At a card reward (during a run):** type the offered cards, with a trailing `+` for upgraded ones (the game doesn't save them). Everything else, including whether it was a normal, elite or boss fight, comes from the game's save of your run in progress.
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m sts2_advisor.suggest "Shrug It Off" Anger Headbutt+
@@ -28,6 +28,8 @@ PYTHONPATH=src .venv/bin/python -m sts2_advisor.suggest "Shrug It Off" Anger Hea
 - **Clear call** (2+ points ahead): take it.
 - **Slight edge:** the advisor leans one way; use your judgement.
 - **Close call:** the options are effectively equal on win chance, so it suggests what most players take, and your own read of the deck is as good as the advisor's.
+
+On macOS it can also read the cards off the screen, so you don't type anything: `--screen` reads them once, and `--auto` keeps watching and advises at every reward. See [Reading the cards off the screen](#reading-the-cards-off-the-screen-macos).
 
 See [What should I pick?](#what-should-i-pick-during-a-run) and [How much to trust the advice](#how-much-to-trust-the-advice).
 
@@ -263,7 +265,7 @@ At a card reward, type the offered cards (a trailing `+` means upgraded):
 PYTHONPATH=src .venv/bin/python -m sts2_advisor.suggest "Fear" "Drain Power" "Defy+"
 ```
 
-Everything else comes from the game's save of your run in progress (`current_run.save`, next to the run history): character, ascension, act, floor, HP, gold, every card in your deck with its upgrades, and your relics. Add `--elite` or `--boss` for those rewards.
+Everything else comes from the game's save of your run in progress (`current_run.save`, next to the run history): character, ascension, act, floor, HP, gold, every card in your deck with its upgrades, your relics, and, while the reward screen is open, whether it was a normal, elite or boss fight. `--elite` / `--boss` are only needed if you ask after leaving the reward screen.
 
 ```
 Necrobinder A5, act 2 floor 30 (monster), HP 51/73, 417 gold, 25-card deck, 10 relics
@@ -283,7 +285,75 @@ Necrobinder A5, act 2 floor 30 (monster), HP 51/73, 417 gold, 25-card deck, 10 r
 - **Floor:** read from the save. It may be one off, depending on exactly when the game saved, which barely matters; `--floor` overrides it.
 - **Finding the save:** next to the history folder that `watch.py` finds, or set `--save` / `$STS2_SAVE`.
 - **Co-op saves** need `--player N`.
-- If a reward screen is open in the save, its cards are used when you don't type any. The save's format for that isn't documented, so this is best-effort.
+- **The offered cards aren't in the save:** the game creates them when the reward screen opens, so you type them, or let the advisor read them off the screen (below).
+
+### Reading the cards off the screen (macOS)
+
+Instead of typing the cards, the advisor can read them from a screenshot, using the text recognition built into macOS.
+
+One-time setup:
+
+```bash
+.venv/bin/pip install -r requirements-mac.txt
+```
+
+Then allow **Screen Recording** for your terminal app, in System Settings → Privacy & Security → Screen Recording, and restart the terminal.
+
+- **`--screen`:** read the cards now. Run it while the three cards are showing, not the list of rewards:
+
+  ```bash
+  PYTHONPATH=src .venv/bin/python -m sts2_advisor.suggest --screen
+  ```
+
+- **`--auto`:** keep it running in a terminal. Whenever the save shows an open reward screen, it takes a screenshot every couple of seconds until it reads the same cards twice in a row. Then it prints the advice, pops up a notification ("Take INFLAME"), and moves on to the next reward:
+
+  ```bash
+  PYTHONPATH=src .venv/bin/python -m sts2_advisor.suggest --auto
+  ```
+
+- **`--image FILE`:** read the cards from a screenshot you've already taken. Useful for checking what it reads.
+
+**How it works:** the recognised text is matched against the card names your character can be offered (its own cards plus colourless ones). Small reading errors are tolerated, such as "Shrug lt Off" for Shrug It Off. Card descriptions and buttons don't match any card name, so they're ignored. The reward's cards are the names in a single row below the **"Choose a Card"** title, left to right. A card counts as upgraded if its name is drawn in green or ends in `+`. The small `+` is often misread as "t", "-" or ":", so a card name followed by one of those characters also counts. Without that title it reads nothing. That matters after a save-and-quit mid-fight, when the save looks like a reward is open but the cards on screen are your hand.
+
+`--auto` gives advice once per card choice, so a fight that gives two card rewards gets advice for both.
+
+**When it can't read them**, you'll see "No card names found on screen". Either the card choice isn't open yet, or Screen Recording isn't allowed. Typing the cards always works.
+
+**Limits:** only the main display is read (use `--display 2` for another), and it works on macOS only.
+
+### Start-of-act choices (ancients)
+
+Every act opens with an ancient offering relics, one of which you take: Neow in act 1, then one of Tezcatara, Pael, Orobas, Darv, Nonupeipe, Tanx or Vakuu. Run histories record every relic offered and the one picked, so this works like the card advisor. A pick model learns what players take, and a win model learns which choice goes with winning, given your character, ascension, act, HP, gold, relics and deck. The advice is the highest win chance, with near-ties broken by what players take most. Which ancient you're at is worked out from the relics offered.
+
+Build the data and train (about 10 minutes, then seconds):
+
+```bash
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.ancient build
+PYTHONPATH=src .venv/bin/python -m sts2_advisor.ancient train
+```
+
+Ask at the ancient's screen by typing the relics, or by reading them off the screen:
+
+```bash
+pick --ancient Kaleidoscope "Arcane Scroll" "Dowsing Rod"
+pick --ancient --screen
+```
+
+`pick --auto` covers these too once the models are trained. While you're in an act's first room, it looks for relic names on screen and advises once per choice.
+
+**How much to trust it** (community test set, 78,766 choices from players the models never saw):
+
+| | |
+|---|---|
+| Pick model names the player's choice | 53.7% |
+| Win model AUC | 0.748 |
+| Advice agrees with the player | 35.6% |
+| Win rate, took the advice vs not (matched on character, ascension band, act and ancient) | **+6.6 pts** |
+| The same for the popular choice | +0.0 pts |
+
+The gain rises with the predicted margin: +3.0 pts for near-ties, +3.8 for margins of 1–3 pts, +7.8 for 3–6 pts and +13.1 above 6 pts. It holds in every act (act 1 +4.6, act 2 +9.1, act 3 +7.3) and at every ascension band. As with cards, this is correlation: the matching doesn't cover HP or deck, so treat the advice as a strong hint rather than proof. Compared with players, it takes Booming Conch, Phial Holster, Neow's Torment and Neow's Sacrifice more often, and Arcane Scroll, Hefty Tablet and Kaleidoscope less often.
+
+**Not yet checked on a real ancient screen.** If `--screen` or `--auto` misses the relics, typing them always works, and a screenshot of the screen helps tune the reading.
 
 ## Card advisor API
 

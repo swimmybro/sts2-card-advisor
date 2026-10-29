@@ -152,6 +152,16 @@ def test_normalize_card():
     assert normalize_card(" card.pommel_strike ") == ("POMMEL_STRIKE", False)
 
 
+@pytest.mark.parametrize("name, card_id", [
+    ("Fight Me!", "FIGHT_ME"), ("CHARGE!!", "CHARGE"), ("Ascender's Bane", "ASCENDERS_BANE"),
+    ("Flick-Flack", "FLICK_FLACK"), ("Decisions, Decisions", "DECISIONS_DECISIONS"),
+    ("Neow’s Fury", "NEOWS_FURY"), ("Multi-Cast+", "MULTI_CAST"),
+])
+def test_normalize_card_punctuation(name, card_id):
+    """In-game names map to ids the way the game forms them."""
+    assert normalize_card(name)[0] == card_id
+
+
 def test_normalize_relic():
     assert normalize_id("Burning Blood", "relic") == "BURNING_BLOOD"
     assert normalize_id("RELIC.NEOWS_TALISMAN", "relic") == "NEOWS_TALISMAN"

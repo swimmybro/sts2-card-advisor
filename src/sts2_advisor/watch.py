@@ -182,13 +182,19 @@ def format_review(review: RunReview, n_worst: int = 3) -> str:
     r = review.rewards
     has_win = "win_top" in r
     lines = [head, ""]
-    for x in r.itertuples():
-        line = f"  F{x.floor:<3} {x.room:<8} {', '.join(x.offered):<44} you: {x.yours:<16}"
+    # columns as wide as this run's longest entries, so long card names don't shift them
+    offered = [", ".join(o) for o in r["offered"]]
+    w_offer = max(map(len, offered))
+    w_card = max(map(len, list(r["yours"]) + list(r["pick_top"])))
+    best_labels = ([t + (" (tie)" if tb else "") for t, tb in zip(r["win_top"], r["tie_broken"])]
+                   if has_win else [])
+    w_best = max(map(len, best_labels), default=0)
+    for i, x in enumerate(r.itertuples()):
+        line = f"  F{x.floor:<3} {x.room:<8} {offered[i]:<{w_offer}}  you: {x.yours:<{w_card}}"
         if has_win:
-            best = x.win_top + (" (tie)" if x.tie_broken else "")
             flag = " (low confidence)" if x.best_low_confidence and not x.agrees_win else ""
-            line += (f" best: {best:<16} win {x.your_win:5.1%} vs {x.best_win:5.1%}{flag}"
-                     f"   popular: {x.pick_top}")
+            line += (f"  best: {best_labels[i]:<{w_best}}  win {x.your_win:5.1%} vs "
+                     f"{x.best_win:5.1%}{flag}   popular: {x.pick_top}")
         else:
             line += f" popular: {x.pick_top}"
         lines.append(line.rstrip())
